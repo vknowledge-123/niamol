@@ -11,6 +11,7 @@ from app.services.market.models import Candle, SpotTick
 
 
 LadderSide = Literal["CALL", "PUT"]
+DayLockReason = Literal["target", "max_losses"]
 
 
 class Mode(str, Enum):
@@ -57,7 +58,8 @@ class LadderState:
     side: LadderSide
     entry_spot: float
     stop_spot: float
-    trail_level: int
+    high_watermark: float
+    low_watermark: float
     next_add_level: int
     lots_open: int
 
@@ -65,12 +67,14 @@ class LadderState:
 class StrategyEngine:
     def __init__(self) -> None:
         self.mode: Mode = Mode.WAITING_BREAKOUT
-        self._candles: Deque[Candle] = deque(maxlen=2)
+        # Store a small rolling window; actual consecutive requirement is taken from config.
+        self._candles: Deque[Candle] = deque(maxlen=20)
         self._setup: Optional[BreakoutSetup] = None
         self._ladder: Optional[LadderState] = None
 
         self.loss_count: int = 0
         self.day_locked: bool = False
+        self.day_lock_reason: Optional[DayLockReason] = None
         self._started_once: bool = False
         self.last_tick: Optional[SpotTick] = None
 
@@ -112,27 +116,54 @@ class StrategyEngine:
         self._ladder = None
         self.loss_count = 0
         self.day_locked = False
+        self.day_lock_reason = None
         self._started_once = False
+
+    def maybe_unlock_day(self, cfg: EngineConfig) -> bool:
+        """
+        If the engine was day-locked due to max-losses and the user increases
+        `max_losses_per_day`, unlock immediately to allow trading again.
+        """
+        if not self.day_locked:
+            return False
+        if self.day_lock_reason != "max_losses":
+            return False
+        if self.loss_count >= int(cfg.max_losses_per_day):
+            return False
+
+        self.day_locked = False
+        self.day_lock_reason = None
+        self.mode = Mode.WAITING_BREAKOUT
+        self._setup = None
+        self._candles.clear()
+        self._started_once = False
+        return True
 
     def on_candle(self, candle: Candle, cfg: EngineConfig) -> None:
         if self.day_locked or self._started_once:
             return
 
         self._candles.append(candle)
-        if len(self._candles) < 2:
+        n = int(getattr(cfg, "require_two_consecutive", 2) or 2)
+        if n < 2:
+            n = 2
+        while len(self._candles) > n:
+            self._candles.popleft()
+        if len(self._candles) < n:
             return
 
-        c1, c2 = self._candles[0], self._candles[1]
+        seq = list(self._candles)
+        last = seq[-1]
         pref = getattr(cfg, "start_preference", "AUTO")
         if pref not in ("AUTO", "CALL", "PUT"):
             pref = "AUTO"
 
-        if (pref in ("AUTO", "CALL")) and c1.green and c2.green:
-            self._setup = BreakoutSetup(side="CALL", trigger=c2.high, formed_at=c2.end)
+        if (pref in ("AUTO", "CALL")) and all(c.green for c in seq):
+            self._setup = BreakoutSetup(side="CALL", trigger=last.high, formed_at=last.end)
             return
 
-        if (pref in ("AUTO", "PUT")) and c1.red and c2.red:
-            self._setup = BreakoutSetup(side="PUT", trigger=c2.low, formed_at=c2.end)
+        if (pref in ("AUTO", "PUT")) and all(c.red for c in seq):
+            self._setup = BreakoutSetup(side="PUT", trigger=last.low, formed_at=last.end)
             return
 
         self._setup = None
@@ -171,22 +202,28 @@ class StrategyEngine:
             actions.append(
                 CloseLadder(side=ladder.side, spot=tick.ltp, lots_open=ladder.lots_open, reason="target", flip_to=None)
             )
-            self._close_and_lock_day()
+            self._close_and_lock_day(reason="target")
             return actions
 
-        # Update trail + add levels (step-based)
-        if cfg.trail_step_points > 0:
-            new_trail_level = int(favorable // cfg.trail_step_points)
-        else:
-            new_trail_level = ladder.trail_level
-
-        if new_trail_level > ladder.trail_level:
-            # 1:1 trailing in steps: stop = entry + (level-1)*step for CALL, entry - (level-1)*step for PUT
+        # Continuous trailing stop (watermark-based), tick-by-tick.
+        # CALL: track highest spot since entry -> stop = high - trail
+        # PUT: track lowest spot since entry -> stop = low + trail
+        trail = int(cfg.trail_step_points)
+        if trail > 0:
             if ladder.side == "CALL":
-                ladder.stop_spot = ladder.entry_spot + max(0, new_trail_level - 1) * cfg.trail_step_points
+                if tick.ltp > ladder.high_watermark:
+                    ladder.high_watermark = tick.ltp
+                if (ladder.high_watermark - ladder.entry_spot) >= trail:
+                    new_stop = float(ladder.high_watermark - trail)
+                    if new_stop > ladder.stop_spot:
+                        ladder.stop_spot = new_stop
             else:
-                ladder.stop_spot = ladder.entry_spot - max(0, new_trail_level - 1) * cfg.trail_step_points
-            ladder.trail_level = new_trail_level
+                if tick.ltp < ladder.low_watermark:
+                    ladder.low_watermark = tick.ltp
+                if (ladder.entry_spot - ladder.low_watermark) >= trail:
+                    new_stop = float(ladder.low_watermark + trail)
+                    if new_stop < ladder.stop_spot:
+                        ladder.stop_spot = new_stop
 
         # Pyramiding at each add_step_points in favorable direction
         if cfg.add_step_points > 0:
@@ -211,7 +248,8 @@ class StrategyEngine:
             side=side,
             entry_spot=spot,
             stop_spot=stop,
-            trail_level=0,
+            high_watermark=spot,
+            low_watermark=spot,
             next_add_level=1,
             lots_open=cfg.lots_per_add,
         )
@@ -234,7 +272,7 @@ class StrategyEngine:
                     side=ladder.side, spot=exit_spot, lots_open=ladder.lots_open, reason="stop_max_losses", flip_to=None
                 )
             ]
-            self._close_and_lock_day()
+            self._close_and_lock_day(reason="max_losses")
             return out
 
         self.loss_count = new_loss_count
@@ -245,7 +283,8 @@ class StrategyEngine:
         self._open_ladder(side=flip_to, spot=exit_spot, cfg=cfg)
         return out
 
-    def _close_and_lock_day(self) -> None:
+    def _close_and_lock_day(self, *, reason: DayLockReason) -> None:
         self._ladder = None
         self.day_locked = True
+        self.day_lock_reason = reason
         self.mode = Mode.DAY_LOCKED

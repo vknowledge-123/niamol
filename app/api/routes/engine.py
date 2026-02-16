@@ -56,3 +56,8 @@ async def stop_engine(request: Request) -> EngineStatus:
 @router.get("/engine/status", response_model=EngineStatus)
 async def engine_status(request: Request) -> EngineStatus:
     return await request.app.state.ctx.engine.status()
+
+
+@router.get("/engine/latency")
+async def engine_latency(request: Request) -> dict:
+    return request.app.state.ctx.engine.latency_snapshot()

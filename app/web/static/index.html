@@ -89,6 +89,14 @@
         overflow: auto;
         min-height: 130px;
       }
+      .tablewrap{ margin-top: 10px; overflow:auto; border-radius: 14px; border: 1px solid rgba(255,255,255,0.10); }
+      table{ width:100%; border-collapse: collapse; font-size: 12px; }
+      th, td{ padding: 8px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); text-align: left; vertical-align: top; }
+      th{ position: sticky; top: 0; background: rgba(10,12,18,0.92); backdrop-filter: blur(6px); color: rgba(255,255,255,0.75); font-weight: 600; }
+      tr:hover td{ background: rgba(255,255,255,0.03); }
+      .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .good{ color: var(--good); }
+      .bad{ color: var(--bad); }
       .pill{
         display:inline-flex; align-items:center; gap:8px;
         padding: 6px 10px;
@@ -233,6 +241,7 @@
               <button id="btn_start" class="btn-primary" onclick="safe(startEngine)">Start engine</button>
               <button id="btn_stop" class="btn-danger" onclick="safe(stopEngine)">Stop engine</button>
               <button id="btn_status" onclick="safe(pollStatus)">Refresh status</button>
+              <button id="btn_latency" onclick="safe(loadLatency)">Latency</button>
             </div>
           </div>
 
@@ -250,6 +259,56 @@
           </div>
 
           <pre id="status">{}</pre>
+          <pre id="latency">{}</pre>
+        </div>
+
+        <div class="card" style="grid-column: span 12;">
+          <h3>Simulation</h3>
+          <div class="row2" style="align-items:center;">
+            <div class="actions" style="margin-top:0;">
+              <button id="btn_sim_start" class="btn-primary" onclick="safe(startSim)">Start simulation</button>
+              <button id="btn_sim_stop" class="btn-danger" onclick="safe(stopSim)">Stop simulation</button>
+              <button id="btn_sim_status" onclick="safe(pollSim)">Refresh sim</button>
+              <button id="btn_sim_trades" onclick="safe(loadSimTrades)">Refresh trades</button>
+            </div>
+            <div class="top-right">
+              <span class="pill"><span class="dot" id="dot_sim"></span><span id="pill_sim">Stopped</span></span>
+            </div>
+          </div>
+
+          <div class="kv" style="margin-top: 10px;">
+            <div class="k">Mode</div><div class="v" id="sim_mode">-</div>
+            <div class="k">Active ladder</div><div class="v" id="sim_ladder">-</div>
+            <div class="k">Spot LTP</div><div class="v" id="sim_spot">-</div>
+            <div class="k">Open trade</div><div class="v" id="sim_open">-</div>
+            <div class="k">Trades total</div><div class="v" id="sim_count">0</div>
+            <div class="k">Last error</div><div class="v" id="sim_err">-</div>
+          </div>
+
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Side</th>
+                  <th>Symbol</th>
+                  <th>Qty</th>
+                  <th class="mono">Spot in</th>
+                  <th class="mono">Spot out</th>
+                  <th class="mono">Prem in</th>
+                  <th class="mono">Prem out</th>
+                  <th class="mono">P&amp;L</th>
+                  <th>Status</th>
+                  <th>Reason</th>
+                  <th class="mono">Entry time</th>
+                  <th class="mono">Exit time</th>
+                </tr>
+              </thead>
+              <tbody id="sim_trades_body"></tbody>
+            </table>
+          </div>
+
+          <pre id="sim_status">{}</pre>
         </div>
       </div>
 
@@ -403,10 +462,50 @@
         renderStatus(status);
       }
 
+      async function loadLatency() {
+        const lat = await apiJson("/api/engine/latency");
+        renderLatency(lat);
+        toast("Latency loaded", null, "good");
+      }
+
+      async function startSim() {
+        const st = await apiJson("/api/sim/start", { method: "POST" });
+        renderSimStatus(st);
+        await loadSimTrades();
+        toast("Simulation started", null, "good");
+      }
+
+      async function stopSim() {
+        const st = await apiJson("/api/sim/stop", { method: "POST" });
+        renderSimStatus(st);
+        toast("Simulation stopped", null, "good");
+      }
+
+      async function pollSim() {
+        const st = await apiJson("/api/sim/status");
+        renderSimStatus(st);
+      }
+
+      async function loadSimTrades() {
+        const trades = await apiJson("/api/sim/trades?limit=200");
+        renderSimTrades(trades);
+      }
+
       function fmt(n) {
         if (n === null || n === undefined) return "-";
         if (typeof n === "number") return Number.isFinite(n) ? n.toFixed(2) : String(n);
         return String(n);
+      }
+
+      function fmtTs(ts) {
+        if (!ts) return "-";
+        try {
+          const d = new Date(ts);
+          if (Number.isNaN(d.getTime())) return String(ts);
+          return d.toLocaleTimeString(undefined, { hour12: false });
+        } catch {
+          return String(ts);
+        }
       }
 
       function renderStatus(status) {
@@ -428,6 +527,50 @@
         $("dot_trade").className = `dot ${status.trading_enabled ? "good" : ""}`;
       }
 
+      function renderLatency(lat) {
+        $("latency").textContent = JSON.stringify(lat, null, 2);
+      }
+
+      function renderSimStatus(st) {
+        $("sim_status").textContent = JSON.stringify(st, null, 2);
+        $("sim_mode").textContent = st.mode ?? "-";
+        $("sim_ladder").textContent = st.active_ladder ?? "-";
+        $("sim_spot").textContent = fmt(st.spot_ltp);
+        $("sim_open").textContent = st.open_trade_id ? String(st.open_trade_id) : "-";
+        $("sim_count").textContent = String(st.trades_total ?? 0);
+        $("sim_err").textContent = st.last_error ? String(st.last_error) : "-";
+
+        $("pill_sim").textContent = st.running ? "Running" : "Stopped";
+        $("dot_sim").className = `dot ${st.running ? "good" : "bad"}`;
+      }
+
+      function renderSimTrades(trades) {
+        const body = $("sim_trades_body");
+        body.innerHTML = "";
+        for (const t of (trades || [])) {
+          const tr = document.createElement("tr");
+          const pnl = (t.pnl === null || t.pnl === undefined) ? null : Number(t.pnl);
+          const pnlCls = pnl === null ? "" : (pnl >= 0 ? "good" : "bad");
+
+          tr.innerHTML = `
+            <td class="mono">${escapeHtml(String(t.id ?? ""))}</td>
+            <td>${escapeHtml(String(t.side ?? ""))}</td>
+            <td class="mono">${escapeHtml(String(t.symbol ?? ""))}</td>
+            <td class="mono">${escapeHtml(String(t.qty ?? ""))}</td>
+            <td class="mono">${escapeHtml(fmt(t.entry_spot))}</td>
+            <td class="mono">${escapeHtml(fmt(t.exit_spot))}</td>
+            <td class="mono">${escapeHtml(fmt(t.entry_premium))}</td>
+            <td class="mono">${escapeHtml(fmt(t.exit_premium))}</td>
+            <td class="mono ${pnlCls}">${escapeHtml(pnl === null ? "-" : pnl.toFixed(2))}</td>
+            <td>${escapeHtml(String(t.status ?? ""))}</td>
+            <td>${escapeHtml(String(t.exit_reason ?? ""))}</td>
+            <td class="mono">${escapeHtml(fmtTs(t.entry_ts))}</td>
+            <td class="mono">${escapeHtml(fmtTs(t.exit_ts))}</td>
+          `;
+          body.appendChild(tr);
+        }
+      }
+
       window.addEventListener("unhandledrejection", (event) => {
         const msg = (event && event.reason && event.reason.message) ? event.reason.message : String(event.reason || event);
         $("status").textContent = `ERROR: ${msg}`;
@@ -435,7 +578,7 @@
       });
 
       // Initial load
-      safe(async () => { await loadConfig(); await pollStatus(); });
+      safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
 
       // Persist important toggles immediately so browser refresh keeps state.
       $("trading_enabled").addEventListener("change", () =>
@@ -453,6 +596,15 @@
         if (!running) return;
         bgInFlight = true;
         safeBg(pollStatus).finally(() => { bgInFlight = false; });
+      }, 1000);
+
+      let simBgInFlight = false;
+      setInterval(() => {
+        if (simBgInFlight) return;
+        const running = $("pill_sim").textContent === "Running";
+        if (!running) return;
+        simBgInFlight = true;
+        safeBg(async () => { await pollSim(); await loadSimTrades(); }).finally(() => { simBgInFlight = false; });
       }, 1000);
     </script>
     </div>

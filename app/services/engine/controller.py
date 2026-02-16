@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from zoneinfo import ZoneInfo
 
 from app.runtime.instruments import InstrumentStore, OptionContract
-from app.runtime.settings import EngineConfigStore, EngineStatus
+from app.runtime.settings import EngineConfig, EngineConfigStore, EngineStatus
+from app.services.engine.latency import LatencyRecorder
 from app.services.candles.aggregator import CandleAggregator
 from app.services.dhan.feed import DhanMarketFeed
 from app.services.dhan.rest import DhanRest
@@ -26,6 +28,31 @@ IST = ZoneInfo("Asia/Kolkata")
 class _OrderBatch:
     # A batch is executed sequentially by the order worker.
     ops: list[tuple[str, str, int, str]]  # (txn, security_id, quantity, tag)
+    enqueued_ns: int
+
+
+RunMode = Literal["LIVE", "SIM"]
+
+
+@dataclass(slots=True)
+class _SimFill:
+    ts: datetime
+    spot: float
+    qty: int
+    premium: Optional[float]
+
+
+@dataclass(slots=True)
+class _SimTrade:
+    id: int
+    side: str  # CALL/PUT
+    contract: OptionContract
+    fills: list[_SimFill]
+    exit_ts: Optional[datetime] = None
+    exit_spot: Optional[float] = None
+    exit_premium: Optional[float] = None
+    exit_reason: Optional[str] = None
+    flip_to: Optional[str] = None
 
 
 class EngineController:
@@ -49,16 +76,30 @@ class EngineController:
         self._last_error: Optional[str] = None
         self._last_ist_date: Optional[str] = None
         self._spot_security_id: Optional[str] = None
+        self._run_mode: Optional[RunMode] = None
+        self._lat = LatencyRecorder(sample_every_n=10, maxlen=4096)
+        self._last_recv_ns: Optional[int] = None
 
-    async def start(self) -> None:
+        # Simulation state (in-memory)
+        self._sim_seq: int = 0
+        self._sim_trades: list[_SimTrade] = []
+        self._sim_active: Optional[_SimTrade] = None
+
+        # Cached config override to allow simulation even when config.trading_enabled is false.
+        self._sim_cfg_ver: int = -1
+        self._sim_cfg_override: Optional[EngineConfig] = None
+
+    async def start(self, mode: RunMode = "LIVE") -> None:
         async with self._lock:
             if self._running:
-                return
+                if self._run_mode == mode:
+                    return
+                raise RuntimeError(f"Engine already running in mode={self._run_mode}. Stop it before starting {mode}.")
 
             try:
                 cfg = await self._cfg_store.get()
-                if not cfg.trading_enabled:
-                    msg = "Set trading_enabled=true in config before starting."
+                if mode == "LIVE" and not cfg.trading_enabled:
+                    msg = "Set trading_enabled=true in config before starting (or use simulation)."
                     self._last_error = msg
                     raise RuntimeError(msg)
                 if not cfg.client_id or not cfg.access_token:
@@ -80,24 +121,33 @@ class EngineController:
                     msg = f"Dhan marketfeed connection failed: {e}"
                     self._last_error = msg
                     raise RuntimeError(msg) from e
-                self._rest = DhanRest(cfg.client_id, cfg.access_token)
-
-                # Simple auth check (raises if token invalid / network issue)
-                try:
-                    self._rest.client.get_fund_limits()
-                except Exception as e:
-                    msg = f"Dhan authentication failed: {e}"
-                    self._last_error = msg
-                    raise RuntimeError(msg) from e
+                self._rest = None
+                if mode == "LIVE":
+                    self._rest = DhanRest(cfg.client_id, cfg.access_token)
+                    # Simple auth check (raises if token invalid / network issue)
+                    try:
+                        await asyncio.to_thread(self._rest.client.get_fund_limits)
+                    except Exception as e:
+                        msg = f"Dhan authentication failed: {e}"
+                        self._last_error = msg
+                        raise RuntimeError(msg) from e
 
                 self._engine.reset_day()
                 self._active_contract = None
                 self._option_ltps.clear()
+                self._run_mode = mode
+                if mode == "SIM":
+                    self._sim_seq = 0
+                    self._sim_trades.clear()
+                    self._sim_active = None
 
                 self._running = True
                 self._last_error = None
+                self._lat.inc("engine_start")
 
-                self._orders_task = asyncio.create_task(self._orders_worker(), name="orders_worker")
+                self._orders_task = None
+                if mode == "LIVE":
+                    self._orders_task = asyncio.create_task(self._orders_worker(), name="orders_worker")
                 self._market_task = asyncio.create_task(self._market_loop(), name="market_loop")
             except Exception as e:
                 # Best-effort cleanup if partial init happened.
@@ -116,6 +166,7 @@ class EngineController:
     async def stop(self) -> None:
         async with self._lock:
             self._running = False
+            self._run_mode = None
 
         if self._market_task:
             self._market_task.cancel()
@@ -136,6 +187,7 @@ class EngineController:
 
         self._active_contract = None
         self._option_ltps.clear()
+        self._lat.inc("engine_stop")
 
     async def status(self) -> EngineStatus:
         cfg = self._cfg_store.current()
@@ -156,6 +208,84 @@ class EngineController:
             last_error=self._last_error,
         )
 
+    def sim_trades(self, limit: int = 200) -> list[dict]:
+        out: list[dict] = []
+        last_spot = None if self._engine.last_tick is None else float(self._engine.last_tick.ltp)
+        window = self._sim_trades[-max(1, int(limit)) :] if self._sim_trades else []
+        for tr in window:
+            qty_total = sum(f.qty for f in tr.fills)
+            entry_fill = tr.fills[0] if tr.fills else None
+
+            entry_premium = None
+            if qty_total > 0 and tr.fills and all(f.premium is not None for f in tr.fills):
+                entry_premium = sum(f.qty * float(f.premium) for f in tr.fills) / qty_total  # type: ignore[arg-type]
+
+            mark_premium = self._option_ltps.get(tr.contract.security_id)
+            is_open = tr.exit_ts is None
+            eff_exit_premium = (mark_premium if is_open else tr.exit_premium)
+            eff_exit_spot = (last_spot if is_open else tr.exit_spot)
+
+            pnl = None
+            if eff_exit_premium is not None and tr.fills and all(f.premium is not None for f in tr.fills):
+                pnl = sum(f.qty * (float(eff_exit_premium) - float(f.premium)) for f in tr.fills)  # type: ignore[arg-type]
+
+            spot_pnl_points = None
+            if entry_fill and eff_exit_spot is not None:
+                if tr.side == "CALL":
+                    spot_pnl_points = float(eff_exit_spot) - float(entry_fill.spot)
+                else:
+                    spot_pnl_points = float(entry_fill.spot) - float(eff_exit_spot)
+
+            out.append(
+                {
+                    "id": tr.id,
+                    "side": tr.side,
+                    "symbol": tr.contract.trading_symbol,
+                    "security_id": tr.contract.security_id,
+                    "qty": qty_total,
+                    "entry_ts": None if entry_fill is None else entry_fill.ts.isoformat(),
+                    "entry_spot": None if entry_fill is None else entry_fill.spot,
+                    "entry_premium": entry_premium,
+                    "exit_ts": None if tr.exit_ts is None else tr.exit_ts.isoformat(),
+                    "exit_spot": eff_exit_spot,
+                    "exit_premium": eff_exit_premium,
+                    "exit_reason": None if is_open else tr.exit_reason,
+                    "status": "OPEN" if is_open else "CLOSED",
+                    "spot_pnl_points": spot_pnl_points,
+                    "pnl": pnl,
+                }
+            )
+        return out
+
+    def sim_status(self) -> dict:
+        tick = self._engine.last_tick
+        return {
+            "running": bool(self._running and self._run_mode == "SIM"),
+            "spot_ltp": None if tick is None else tick.ltp,
+            "mode": self._engine.mode.value,
+            "active_ladder": self._engine.active_side,
+            "open_trade_id": None if self._sim_active is None else self._sim_active.id,
+            "trades_total": len(self._sim_trades),
+            "last_error": self._last_error,
+        }
+
+    def _cfg_for_engine(self, cfg: EngineConfig) -> EngineConfig:
+        if self._run_mode != "SIM" or cfg.trading_enabled:
+            return cfg
+        ver = self._cfg_store.version()
+        if self._sim_cfg_override is None or self._sim_cfg_ver != ver:
+            self._sim_cfg_override = cfg.model_copy(update={"trading_enabled": True})
+            self._sim_cfg_ver = ver
+        return self._sim_cfg_override
+
+    def latency_snapshot(self) -> dict:
+        snap = self._lat.snapshot()
+        snap["mode"] = self._run_mode
+        snap["running"] = self._running
+        snap["orders_queue_size"] = int(self._orders_q.qsize())
+        snap["option_ltps_size"] = int(len(self._option_ltps))
+        return snap
+
     async def _market_loop(self) -> None:
         assert self._feed is not None
 
@@ -168,8 +298,18 @@ class EngineController:
 
         while self._running:
             try:
+                sample = self._lat.next_tick_should_sample()
+
+                t0 = self._lat.now_ns() if sample else 0
                 feed_tick = await self._feed.recv_tick()
+                t1 = self._lat.now_ns() if sample else 0
+                if sample:
+                    self._lat.add_ns("ws_recv", t1 - t0)
+                    if self._last_recv_ns is not None:
+                        self._lat.add_ns("tick_interval", t1 - self._last_recv_ns)
+                    self._last_recv_ns = t1
                 if feed_tick is None:
+                    self._lat.inc("tick_none")
                     continue
 
                 now = datetime.now(tz=IST)
@@ -184,24 +324,72 @@ class EngineController:
                     self._option_ltps.clear()
 
                 cfg = self._cfg_store.current()
+                cfg_eng = self._cfg_for_engine(cfg)
+                self._engine.maybe_unlock_day(cfg_eng)
 
                 # Route ticks: spot vs active option
                 if feed_tick.security_id == str(spot_sid):
+                    t_spot0 = self._lat.now_ns() if sample else 0
                     tick = SpotTick(ts=now, ltp=feed_tick.ltp)
+                    t_agg0 = self._lat.now_ns() if sample else 0
                     completed = agg.push(tick)
+                    t_agg1 = self._lat.now_ns() if sample else 0
+                    if sample:
+                        self._lat.add_ns("agg_push", t_agg1 - t_agg0)
                     if completed:
-                        self._engine.on_candle(completed, cfg)
-                    actions = self._engine.on_tick(tick, cfg)
-                    await self._handle_actions(actions, spot=tick.ltp, cfg=cfg, now=now)
+                        t_c0 = self._lat.now_ns() if sample else 0
+                        self._engine.on_candle(completed, cfg_eng)
+                        t_c1 = self._lat.now_ns() if sample else 0
+                        if sample:
+                            self._lat.add_ns("strategy_on_candle", t_c1 - t_c0)
+
+                    t_s0 = self._lat.now_ns() if sample else 0
+                    actions = self._engine.on_tick(tick, cfg_eng)
+                    t_s1 = self._lat.now_ns() if sample else 0
+                    if sample:
+                        self._lat.add_ns("strategy_on_tick", t_s1 - t_s0)
+
+                    t_h0 = self._lat.now_ns() if sample else 0
+                    await self._handle_actions(actions, spot=tick.ltp, cfg=cfg_eng, now=now)
+                    t_h1 = self._lat.now_ns() if sample else 0
+                    if sample:
+                        self._lat.add_ns("handle_actions", t_h1 - t_h0)
+                        self._lat.add_ns("spot_tick_total", t_h1 - t_spot0)
+                    self._lat.inc("spot_ticks")
                 else:
+                    t_opt0 = self._lat.now_ns() if sample else 0
                     self._option_ltps[feed_tick.security_id] = feed_tick.ltp
+                    if self._run_mode == "SIM":
+                        self._sim_on_option_tick(feed_tick.security_id, feed_tick.ltp)
+                    if sample:
+                        self._lat.add_ns("option_tick_total", self._lat.now_ns() - t_opt0)
+                    self._lat.inc("option_ticks")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._last_error = str(e)
                 log.exception("market loop error: %s", e)
+                self._lat.inc("market_loop_error")
 
     async def _handle_actions(self, actions, *, spot: float, cfg, now: datetime) -> None:
+        if self._run_mode == "SIM":
+            for action in actions:
+                if isinstance(action, OpenLadder):
+                    await self._sim_open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
+                elif isinstance(action, AddLot):
+                    await self._sim_add_lots(side=action.side, levels=action.levels, spot=action.spot, cfg=cfg, now=now)
+                elif isinstance(action, CloseLadder):
+                    await self._sim_close_ladder(
+                        side=action.side,
+                        spot=action.spot,
+                        lots_open=action.lots_open,
+                        reason=action.reason,
+                        flip_to=action.flip_to,
+                        cfg=cfg,
+                        now=now,
+                    )
+            return
+
         for action in actions:
             if isinstance(action, OpenLadder):
                 await self._open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
@@ -217,6 +405,81 @@ class EngineController:
                     cfg=cfg,
                     now=now,
                 )
+
+    def _sim_on_option_tick(self, security_id: str, ltp: float) -> None:
+        # Fill any pending premiums for the most-recent trade(s) on this contract.
+        if not self._sim_trades:
+            return
+        filled = 0
+        for tr in reversed(self._sim_trades):
+            if tr.contract.security_id != security_id:
+                continue
+            did = False
+            for f in tr.fills:
+                if f.premium is None:
+                    f.premium = float(ltp)
+                    did = True
+            if tr.exit_ts is not None and tr.exit_premium is None:
+                tr.exit_premium = float(ltp)
+                did = True
+            if did:
+                filled += 1
+            # Don't scan too far on every tick.
+            if filled >= 3:
+                break
+
+    async def _sim_open_ladder_with_contract(
+        self, *, side: str, spot: float, contract: OptionContract, cfg, now: datetime, unsubscribe_old: Optional[OptionContract] = None
+    ) -> None:
+        await self._ensure_option_subscription(contract, unsubscribe_old=unsubscribe_old)
+
+        self._sim_seq += 1
+        tr = _SimTrade(id=self._sim_seq, side=str(side), contract=contract, fills=[])
+        self._sim_trades.append(tr)
+        self._sim_active = tr
+        self._active_contract = contract
+
+        qty = max(1, contract.lot_size) * cfg.lots_per_add
+        prem = self._option_ltps.get(contract.security_id)
+        tr.fills.append(_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem)))
+
+    async def _sim_open_ladder(self, *, side: str, spot: float, cfg, now: datetime) -> None:
+        contract = await self._select_option_contract(side=side, spot=spot, now=now, cfg=cfg)
+        await self._sim_open_ladder_with_contract(side=side, spot=spot, contract=contract, cfg=cfg, now=now)
+
+    async def _sim_add_lots(self, *, side: str, levels: int, spot: float, cfg, now: datetime) -> None:
+        tr = self._sim_active
+        if tr is None:
+            return
+        if levels <= 0:
+            return
+        qty = max(1, tr.contract.lot_size) * cfg.lots_per_add * int(levels)
+        prem = self._option_ltps.get(tr.contract.security_id)
+        tr.fills.append(_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem)))
+
+    async def _sim_close_ladder(
+        self, *, side: str, spot: float, lots_open: int, reason: str, flip_to: Optional[str], cfg, now: datetime
+    ) -> None:
+        tr = self._sim_active
+        if tr is None:
+            return
+
+        prem = self._option_ltps.get(tr.contract.security_id)
+        tr.exit_ts = now
+        tr.exit_spot = float(spot)
+        tr.exit_premium = None if prem is None else float(prem)
+        tr.exit_reason = str(reason)
+        tr.flip_to = flip_to
+
+        old_contract = tr.contract
+        self._sim_active = None
+        self._active_contract = None
+
+        if flip_to and not self._engine.day_locked:
+            new_contract = await self._select_option_contract(side=flip_to, spot=spot, now=now, cfg=cfg)
+            await self._sim_open_ladder_with_contract(
+                side=flip_to, spot=spot, contract=new_contract, cfg=cfg, now=now, unsubscribe_old=old_contract
+            )
 
     async def _open_ladder(self, *, side: str, spot: float, cfg, now: datetime) -> None:
         contract = await self._select_option_contract(side=side, spot=spot, now=now, cfg=cfg)
@@ -241,7 +504,7 @@ class EngineController:
         old_qty = (max(1, old_contract.lot_size) * int(lots_open)) if old_contract else 0
 
         if flip_to and not self._engine.day_locked:
-            # Low-latency flip requirement: BUY opposite first, then SELL all old lots.
+            # Flip: open opposite first, then close current ladder.
             new_contract = await self._select_option_contract(side=flip_to, spot=spot, now=now, cfg=cfg)
             await self._ensure_option_subscription(new_contract, unsubscribe_old=old_contract)
             new_qty = max(1, new_contract.lot_size) * cfg.lots_per_add
@@ -281,27 +544,37 @@ class EngineController:
             await self._feed.unsubscribe_option(unsubscribe_old.security_id)
 
     async def _enqueue_orders(self, ops: list[tuple[str, str, int, str]], *, cfg) -> None:
-        await self._orders_q.put(_OrderBatch(ops=ops))
+        t0 = self._lat.now_ns()
+        await self._orders_q.put(_OrderBatch(ops=ops, enqueued_ns=t0))
+        if self._lat.should_sample():
+            self._lat.add_ns("orders_put", self._lat.now_ns() - t0)
+        self._lat.inc("orders_enqueued")
 
     async def _orders_worker(self) -> None:
         while self._running:
             try:
                 batch = await self._orders_q.get()
+                self._lat.inc("orders_dequeued")
+                now_ns = self._lat.now_ns()
+                if batch.enqueued_ns:
+                    self._lat.add_ns("orders_queue_wait", now_ns - batch.enqueued_ns)
                 await self._execute_batch(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._last_error = str(e)
                 log.exception("order worker error: %s", e)
+                self._lat.inc("orders_worker_error")
 
     async def _execute_batch(self, batch: _OrderBatch) -> None:
         if self._rest is None:
             return
 
         cfg = self._cfg_store.current()
-        for txn, secid, qty, tag in batch.ops:
+
+        async def _place_one(txn: str, secid: str, qty: int, tag: str) -> None:
             if qty <= 0:
-                continue
+                return
 
             order_type = cfg.order_type
             price = 0.0
@@ -316,7 +589,9 @@ class EngineController:
                 else:
                     price = float(max(0.05, ltp - cfg.limit_price_offset))
 
-            self._rest.place_intraday_option_order(
+            t0_ns = self._lat.now_ns()
+            placed = await asyncio.to_thread(
+                self._rest.place_intraday_option_order,
                 security_id=secid,
                 transaction_type="BUY" if txn == "BUY" else "SELL",
                 quantity=qty,
@@ -324,3 +599,38 @@ class EngineController:
                 price=price,
                 tag=tag,
             )
+            dt_ns = self._lat.now_ns() - t0_ns
+            dt_ms = dt_ns / 1_000_000.0
+            self._lat.add_ns("order_place", dt_ns)
+            if not placed.ok:
+                self._last_error = f"order failed tag={tag} secid={secid} qty={qty} resp={placed.raw}"
+                log.warning("order failed (%.1fms): tag=%s secid=%s qty=%s resp=%s", dt_ms, tag, secid, qty, placed.raw)
+                self._lat.inc("order_fail")
+            else:
+                log.debug("order ok (%.1fms): tag=%s secid=%s qty=%s", dt_ms, tag, secid, qty)
+                self._lat.inc("order_ok")
+
+        # Flip batches are open opposite + close current. Start the open first, but do not wait
+        # for it to complete before submitting the close (avoids entry failures delaying exits).
+        ops = [op for op in batch.ops if op[2] > 0]
+        if len(ops) == 2:
+            (txn1, secid1, qty1, tag1), (txn2, secid2, qty2, tag2) = ops
+            tags = {tag1, tag2}
+            is_flip = any(t.startswith("flip_open_") for t in tags) and any(t.startswith("flip_close_") for t in tags)
+            if is_flip:
+                if tag1.startswith("flip_open_"):
+                    open_op, close_op = (txn1, secid1, qty1, tag1), (txn2, secid2, qty2, tag2)
+                else:
+                    open_op, close_op = (txn2, secid2, qty2, tag2), (txn1, secid1, qty1, tag1)
+
+                open_task = asyncio.create_task(_place_one(*open_op), name=f"order_{open_op[3]}")
+                # Yield once so the open task gets scheduled before we submit the close.
+                await asyncio.sleep(0)
+                try:
+                    await _place_one(*close_op)
+                finally:
+                    await open_task
+                return
+
+        for txn, secid, qty, tag in batch.ops:
+            await _place_one(txn, secid, qty, tag)

@@ -4,6 +4,29 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
+
+def _patch_websockets_closed_attr() -> None:
+    """
+    dhanhq<=2.0.2 expects `ws.closed` (legacy websockets API), but websockets>=12
+    returns `ClientConnection` without a `closed` attribute.
+
+    Add a compatible `closed` property based on the connection state.
+    """
+
+    try:
+        from websockets.asyncio.client import ClientConnection  # type: ignore[import-not-found]
+        from websockets.protocol import State  # type: ignore[import-not-found]
+    except Exception:
+        return
+
+    if hasattr(ClientConnection, "closed"):
+        return
+
+    ClientConnection.closed = property(lambda self: self.state is State.CLOSED)  # type: ignore[attr-defined]
+
+
+_patch_websockets_closed_attr()
+
 from dhanhq.marketfeed import DhanFeed, IDX
 
 
