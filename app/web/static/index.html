@@ -183,6 +183,13 @@
               <input id="strike_step" type="number" />
             </div>
             <div style="flex:1; min-width: 220px;">
+              <label>Weekly expiry</label>
+              <select id="weekly_expiry">
+                <option value="CURRENT">Current weekly</option>
+                <option value="NEXT">Next weekly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
               <label>Lots per add</label>
               <input id="lots_per_add" type="number" />
             </div>
@@ -216,6 +223,10 @@
               <input id="max_losses_per_day" type="number" />
             </div>
             <div style="flex:1; min-width: 220px;">
+              <label>Max adds</label>
+              <input id="max_adds" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
               <label>Order type</label>
               <select id="order_type">
                 <option value="MARKET">MARKET</option>
@@ -235,11 +246,19 @@
               <input id="trading_enabled" type="checkbox" style="width:auto;" />
               Trading enabled (config)
             </label>
+            <div style="min-width: 260px;">
+              <label style="margin-top:0;">Engine type</label>
+              <select id="engine_kind">
+                <option value="BUY">Option buying engine</option>
+                <option value="SELL">Option selling engine</option>
+              </select>
+            </div>
             <div class="actions" style="margin-top:0;">
               <button id="btn_save2" class="btn-primary" onclick="safe(saveConfig)">Save config</button>
               <button id="btn_refresh" onclick="safe(refreshInstruments)">Refresh instruments</button>
               <button id="btn_start" class="btn-primary" onclick="safe(startEngine)">Start engine</button>
               <button id="btn_stop" class="btn-danger" onclick="safe(stopEngine)">Stop engine</button>
+              <button id="btn_sqoff" class="btn-danger" onclick="safe(squareOffStop)">Square off (stop)</button>
               <button id="btn_status" onclick="safe(pollStatus)">Refresh status</button>
               <button id="btn_latency" onclick="safe(loadLatency)">Latency</button>
             </div>
@@ -248,11 +267,18 @@
           <div class="kv" style="margin-top: 10px;">
             <div class="k">Mode</div><div class="v" id="v_mode">-</div>
             <div class="k">Active ladder</div><div class="v" id="v_ladder">-</div>
+            <div class="k">Position</div><div class="v" id="v_position">-</div>
+            <div class="k">Option symbol</div><div class="v mono" id="v_contract">-</div>
+            <div class="k">Option LTP</div><div class="v" id="v_option_ltp">-</div>
+            <div class="k">Contract expiry</div><div class="v mono" id="v_contract_expiry">-</div>
             <div class="k">Spot LTP</div><div class="v" id="v_spot">-</div>
             <div class="k">Entry</div><div class="v" id="v_entry">-</div>
             <div class="k">Stop</div><div class="v" id="v_stop">-</div>
             <div class="k">Next add</div><div class="v" id="v_next">-</div>
             <div class="k">Lots open</div><div class="v" id="v_lots">-</div>
+            <div class="k">Qty</div><div class="v mono" id="v_qty">-</div>
+            <div class="k">Adds</div><div class="v" id="v_adds">-</div>
+            <div class="k">Weekly expiry</div><div class="v" id="v_weekly_expiry">-</div>
             <div class="k">Loss count</div><div class="v" id="v_losses">-</div>
             <div class="k">Day locked</div><div class="v" id="v_locked">-</div>
             <div class="k">Last error</div><div class="v" id="v_err">-</div>
@@ -315,6 +341,15 @@
     <script>
       const $ = (id) => document.getElementById(id);
 
+      function engineKind() {
+        const v = $("engine_kind") ? $("engine_kind").value : "BUY";
+        return v === "SELL" ? "SELL" : "BUY";
+      }
+
+      function apiBase() {
+        return engineKind() === "SELL" ? "/api/sell" : "/api";
+      }
+
       function toast(message, detail, kind = "info") {
         const wrap = $("toasts");
         const el = document.createElement("div");
@@ -330,7 +365,7 @@
       }
 
       function setBusy(busy) {
-        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_start","btn_stop","btn_status"].forEach(id => {
+        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_start","btn_stop","btn_sqoff","btn_status","btn_latency"].forEach(id => {
           const el = $(id);
           if (el) el.disabled = !!busy;
         });
@@ -389,12 +424,14 @@
         $("trading_enabled").checked = !!cfg.trading_enabled;
         $("start_preference").value = cfg.start_preference ?? "AUTO";
         $("strike_step").value = cfg.strike_step ?? 100;
+        $("weekly_expiry").value = cfg.weekly_expiry ?? "CURRENT";
         $("add_step_points").value = cfg.add_step_points ?? 10;
         $("target_points").value = cfg.target_points ?? 50;
         $("trail_step_points").value = cfg.trail_step_points ?? 10;
         $("initial_sl_points").value = cfg.initial_sl_points ?? 10;
         $("lots_per_add").value = cfg.lots_per_add ?? 1;
         $("max_losses_per_day").value = cfg.max_losses_per_day ?? 5;
+        $("max_adds").value = cfg.max_adds ?? 0;
         $("order_type").value = cfg.order_type ?? "MARKET";
         $("limit_price_offset").value = cfg.limit_price_offset ?? 0.0;
 
@@ -409,12 +446,14 @@
           trading_enabled: !!$("trading_enabled").checked,
           start_preference: $("start_preference").value,
           strike_step: Number($("strike_step").value),
+          weekly_expiry: $("weekly_expiry").value,
           add_step_points: Number($("add_step_points").value),
           target_points: Number($("target_points").value),
           trail_step_points: Number($("trail_step_points").value),
           initial_sl_points: Number($("initial_sl_points").value),
           lots_per_add: Number($("lots_per_add").value),
           max_losses_per_day: Number($("max_losses_per_day").value),
+          max_adds: Number($("max_adds").value),
           order_type: $("order_type").value,
           limit_price_offset: Number($("limit_price_offset").value)
         };
@@ -446,48 +485,54 @@
       }
 
       async function startEngine() {
-        const status = await apiJson("/api/engine/start", { method: "POST" });
+        const status = await apiJson(`${apiBase()}/engine/start`, { method: "POST" });
         renderStatus(status);
         toast("Engine started", null, "good");
       }
 
       async function stopEngine() {
-        const status = await apiJson("/api/engine/stop", { method: "POST" });
+        const status = await apiJson(`${apiBase()}/engine/stop`, { method: "POST" });
         renderStatus(status);
         toast("Engine stopped", null, "good");
       }
 
+      async function squareOffStop() {
+        const status = await apiJson(`${apiBase()}/engine/squareoff_stop`, { method: "POST" });
+        renderStatus(status);
+        toast("Squared off", "Engine stopped", "good");
+      }
+
       async function pollStatus() {
-        const status = await apiJson("/api/engine/status");
+        const status = await apiJson(`${apiBase()}/engine/status`);
         renderStatus(status);
       }
 
       async function loadLatency() {
-        const lat = await apiJson("/api/engine/latency");
+        const lat = await apiJson(`${apiBase()}/engine/latency`);
         renderLatency(lat);
         toast("Latency loaded", null, "good");
       }
 
       async function startSim() {
-        const st = await apiJson("/api/sim/start", { method: "POST" });
+        const st = await apiJson(`${apiBase()}/sim/start`, { method: "POST" });
         renderSimStatus(st);
         await loadSimTrades();
         toast("Simulation started", null, "good");
       }
 
       async function stopSim() {
-        const st = await apiJson("/api/sim/stop", { method: "POST" });
+        const st = await apiJson(`${apiBase()}/sim/stop`, { method: "POST" });
         renderSimStatus(st);
         toast("Simulation stopped", null, "good");
       }
 
       async function pollSim() {
-        const st = await apiJson("/api/sim/status");
+        const st = await apiJson(`${apiBase()}/sim/status`);
         renderSimStatus(st);
       }
 
       async function loadSimTrades() {
-        const trades = await apiJson("/api/sim/trades?limit=200");
+        const trades = await apiJson(`${apiBase()}/sim/trades?limit=200`);
         renderSimTrades(trades);
       }
 
@@ -512,11 +557,20 @@
         $("status").textContent = JSON.stringify(status, null, 2);
         $("v_mode").textContent = status.mode ?? "-";
         $("v_ladder").textContent = status.active_ladder ?? "-";
+        $("v_position").textContent = status.position ?? "-";
+        $("v_contract").textContent = status.active_contract_symbol ?? "-";
+        $("v_option_ltp").textContent = fmt(status.active_option_ltp);
+        $("v_contract_expiry").textContent = status.active_contract_expiry ? String(status.active_contract_expiry) : "-";
         $("v_spot").textContent = fmt(status.spot_ltp);
         $("v_entry").textContent = fmt(status.entry_spot);
         $("v_stop").textContent = fmt(status.stop_spot);
         $("v_next").textContent = fmt(status.next_add_spot);
         $("v_lots").textContent = String(status.lots_open ?? 0);
+        $("v_qty").textContent = (status.active_qty === null || status.active_qty === undefined) ? "-" : String(status.active_qty);
+        const addsDone = (status.adds_done ?? 0);
+        const maxAdds = (status.max_adds ?? 0);
+        $("v_adds").textContent = (maxAdds && maxAdds > 0) ? `${addsDone}/${maxAdds}` : String(addsDone);
+        $("v_weekly_expiry").textContent = status.weekly_expiry ?? "-";
         $("v_losses").textContent = String(status.loss_count ?? 0);
         $("v_locked").textContent = String(!!status.day_locked);
         $("v_err").textContent = status.last_error ? String(status.last_error) : "-";
@@ -578,6 +632,8 @@
       });
 
       // Initial load
+      const savedKind = localStorage.getItem("engine_kind");
+      if (savedKind && $("engine_kind")) $("engine_kind").value = savedKind;
       safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
 
       // Persist important toggles immediately so browser refresh keeps state.
@@ -587,6 +643,10 @@
       $("start_preference").addEventListener("change", () =>
         safe(async () => { await patchConfig({ start_preference: $("start_preference").value }); toast("Saved", "start_preference", "good"); })
       );
+      $("engine_kind").addEventListener("change", () => {
+        localStorage.setItem("engine_kind", engineKind());
+        safe(async () => { await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
+      });
 
       // Light auto-poll when running (keeps UI updated without spamming)
       let bgInFlight = false;

@@ -61,6 +61,7 @@ class LadderState:
     high_watermark: float
     low_watermark: float
     next_add_level: int
+    adds_done: int
     lots_open: int
 
 
@@ -77,6 +78,18 @@ class StrategyEngine:
         self.day_lock_reason: Optional[DayLockReason] = None
         self._started_once: bool = False
         self.last_tick: Optional[SpotTick] = None
+
+    @classmethod
+    def for_engine_kind(cls, *, kind: str) -> "StrategyEngine":
+        """
+        Factory hook for engine-kind specific behavior.
+
+        NOTE: Candle criteria are enforced to *start* a ladder (via on_candle/setup).
+        After a ladder is running, a TSL/SL hit flips immediately without re-checking
+        candle criteria (for both BUY and SELL engines).
+        """
+        _ = kind
+        return cls()
 
     @property
     def active_side(self) -> Optional[LadderSide]:
@@ -95,6 +108,10 @@ class StrategyEngine:
     @property
     def lots_open(self) -> int:
         return 0 if self._ladder is None else int(self._ladder.lots_open)
+
+    @property
+    def adds_done(self) -> int:
+        return 0 if self._ladder is None else int(self._ladder.adds_done)
 
     @property
     def next_add_spot(self) -> Optional[float]:
@@ -206,33 +223,37 @@ class StrategyEngine:
             return actions
 
         # Continuous trailing stop (watermark-based), tick-by-tick.
-        # CALL: track highest spot since entry -> stop = high - trail
-        # PUT: track lowest spot since entry -> stop = low + trail
+        # CALL: track highest spot since entry -> stop = high - trail (updates on every new high)
+        # PUT: track lowest spot since entry -> stop = low + trail (updates on every new low)
         trail = int(cfg.trail_step_points)
         if trail > 0:
             if ladder.side == "CALL":
                 if tick.ltp > ladder.high_watermark:
                     ladder.high_watermark = tick.ltp
-                if (ladder.high_watermark - ladder.entry_spot) >= trail:
-                    new_stop = float(ladder.high_watermark - trail)
-                    if new_stop > ladder.stop_spot:
-                        ladder.stop_spot = new_stop
+                new_stop = float(ladder.high_watermark - trail)
+                if new_stop > ladder.stop_spot:
+                    ladder.stop_spot = new_stop
             else:
                 if tick.ltp < ladder.low_watermark:
                     ladder.low_watermark = tick.ltp
-                if (ladder.entry_spot - ladder.low_watermark) >= trail:
-                    new_stop = float(ladder.low_watermark + trail)
-                    if new_stop < ladder.stop_spot:
-                        ladder.stop_spot = new_stop
+                new_stop = float(ladder.low_watermark + trail)
+                if new_stop < ladder.stop_spot:
+                    ladder.stop_spot = new_stop
 
         # Pyramiding at each add_step_points in favorable direction
         if cfg.add_step_points > 0:
             reached_level = int(favorable // cfg.add_step_points)
             if reached_level >= ladder.next_add_level:
-                levels_to_add = reached_level - ladder.next_add_level + 1
+                planned_levels = reached_level - ladder.next_add_level + 1
+                max_adds = int(getattr(cfg, "max_adds", 0) or 0)
+                remaining = None if max_adds <= 0 else max(0, max_adds - int(ladder.adds_done))
+                levels_to_add = planned_levels if remaining is None else min(planned_levels, remaining)
+
                 ladder.next_add_level = reached_level + 1
-                ladder.lots_open += levels_to_add * cfg.lots_per_add
-                actions.append(AddLot(side=ladder.side, spot=tick.ltp, levels=levels_to_add))
+                if levels_to_add > 0:
+                    ladder.adds_done += int(levels_to_add)
+                    ladder.lots_open += levels_to_add * cfg.lots_per_add
+                    actions.append(AddLot(side=ladder.side, spot=tick.ltp, levels=levels_to_add))
 
         # Stop check
         if ladder.side == "CALL" and tick.ltp <= ladder.stop_spot:
@@ -251,6 +272,7 @@ class StrategyEngine:
             high_watermark=spot,
             low_watermark=spot,
             next_add_level=1,
+            adds_done=0,
             lots_open=cfg.lots_per_add,
         )
         self._setup = None
@@ -281,6 +303,55 @@ class StrategyEngine:
             CloseLadder(side=ladder.side, spot=exit_spot, lots_open=ladder.lots_open, reason="stop_flip", flip_to=flip_to)
         ]
         self._open_ladder(side=flip_to, spot=exit_spot, cfg=cfg)
+        return out
+
+    def manual_square_off_and_flip(self, *, spot: float, cfg: EngineConfig) -> list[Action]:
+        """
+        Manual square-off of current ladder and immediate flip to the opposite side.
+        Applies to both BUY and SELL engines.
+        """
+        ladder = self._ladder
+        if ladder is None or self.day_locked:
+            return []
+
+        flip_to: LadderSide = "PUT" if ladder.side == "CALL" else "CALL"
+        out = [
+            CloseLadder(
+                side=ladder.side,
+                spot=float(spot),
+                lots_open=int(ladder.lots_open),
+                reason="manual_flip",
+                flip_to=flip_to,
+            )
+        ]
+        self._open_ladder(side=flip_to, spot=float(spot), cfg=cfg)
+        return out
+
+    def manual_square_off(self, *, spot: float) -> list[Action]:
+        """
+        Manual square-off of the current ladder (no flip).
+
+        Intended to be used with an engine stop; we reset local ladder state
+        back to breakout monitoring.
+        """
+        ladder = self._ladder
+        if ladder is None or self.day_locked:
+            return []
+
+        out = [
+            CloseLadder(
+                side=ladder.side,
+                spot=float(spot),
+                lots_open=int(ladder.lots_open),
+                reason="manual_squareoff",
+                flip_to=None,
+            )
+        ]
+        self.mode = Mode.WAITING_BREAKOUT
+        self._ladder = None
+        self._setup = None
+        self._candles.clear()
+        self._started_once = False
         return out
 
     def _close_and_lock_day(self, *, reason: DayLockReason) -> None:

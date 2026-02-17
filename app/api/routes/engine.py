@@ -57,6 +57,23 @@ async def stop_engine(request: Request) -> EngineStatus:
 async def engine_status(request: Request) -> EngineStatus:
     return await request.app.state.ctx.engine.status()
 
+@router.post("/engine/squareoff_flip", response_model=EngineStatus)
+async def engine_squareoff_flip(request: Request) -> EngineStatus:
+    ctx = request.app.state.ctx
+    try:
+        # Backwards-compatible route: manual square-off now stops the engine (no flip).
+        return await ctx.engine.square_off_and_stop()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+@router.post("/engine/squareoff_stop", response_model=EngineStatus)
+async def engine_squareoff_stop(request: Request) -> EngineStatus:
+    ctx = request.app.state.ctx
+    try:
+        return await ctx.engine.square_off_and_stop()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
 
 @router.get("/engine/latency")
 async def engine_latency(request: Request) -> dict:

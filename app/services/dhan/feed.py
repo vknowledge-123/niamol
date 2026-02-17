@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
+import logging
+import random
+import time
 from typing import Optional
+
+import websockets
+from dhanhq import dhanhq as DhanHQ
 
 
 def _patch_websockets_closed_attr() -> None:
@@ -29,6 +36,8 @@ _patch_websockets_closed_attr()
 
 from dhanhq.marketfeed import DhanFeed, IDX
 
+log = logging.getLogger("niftyalgo.dhan.feed")
+
 
 @dataclass(slots=True)
 class FeedTick:
@@ -52,22 +61,76 @@ class DhanMarketFeed:
             # v2 uses token+clientId in the URL query and is more reliable.
             version="v2",
         )
-        self._connected = False
         self._lock = asyncio.Lock()
+        self._reconnect_attempt: int = 0
+        self._last_disconnect_log_ts: float = 0.0
+        self.last_error: Optional[str] = None
+
+        self._closing: bool = False
+        self._reconnect_task: Optional[asyncio.Task] = None
+
+        # If you want to tune these (e.g. behind flaky networks), make them configurable.
+        self._ping_interval_s: float = 20.0
+        self._ping_timeout_s: float = 20.0
+
+        # REST fallback (LT P polling) when websocket is down.
+        self._rest = DhanHQ(client_id, access_token)
+        self._rest_poll_interval_s: float = 1.0
+        self._rest_next_poll_ts: float = 0.0
+        self._rest_buffer: list[dict] = []
 
     async def connect(self) -> None:
         async with self._lock:
-            if self._connected:
+            if self._closing:
                 return
-            await self._feed.connect()
-            self._connected = True
+            ws = getattr(self._feed, "ws", None)
+            if ws is not None and not getattr(ws, "closed", False):
+                return
+
+            # Implement our own connect so we can control timeouts / keepalive.
+            if self._feed.version == "v1":
+                url = "wss://api-feed.dhan.co"
+            else:
+                url = (
+                    f"wss://api-feed.dhan.co"
+                    f"?version=2&token={self._access_token}&clientId={self._client_id}&authType=2"
+                )
+
+            ws = await websockets.connect(
+                url,
+                ping_interval=self._ping_interval_s,
+                ping_timeout=self._ping_timeout_s,
+                open_timeout=15,
+                close_timeout=5,
+            )
+            self._feed.ws = ws  # type: ignore[attr-defined]
+            if self._feed.version == "v1":
+                await self._feed.authorize()
+            await self._feed.subscribe_instruments()
 
     async def disconnect(self) -> None:
+        self._closing = True
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
         async with self._lock:
-            if not self._connected:
-                return
-            await self._feed.disconnect()
-            self._connected = False
+            try:
+                await self._feed.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+            # dhanhq doesn't always close the underlying websocket; do best-effort here.
+            ws = getattr(self._feed, "ws", None)
+            if ws is not None:
+                try:
+                    await ws.close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            with contextlib.suppress(Exception):
+                self._feed.ws = None  # type: ignore[attr-defined]
 
     async def subscribe_option(self, security_id: str) -> None:
         # Add NSE_FNO option instrument uses exchange segment NSE_FNO=2 in marketfeed constants.
@@ -85,8 +148,280 @@ class DhanMarketFeed:
         async with self._lock:
             self._feed.unsubscribe_symbols([sym])
 
+    def _next_reconnect_delay_s(self) -> float:
+        # Exponential backoff with jitter: 0.5, 1, 2, 4, ... up to 30s (+ small jitter)
+        base = min(30.0, 0.5 * (2 ** max(0, self._reconnect_attempt - 1)))
+        return base + random.random() * 0.25
+
+    @staticmethod
+    def _describe_disconnect(exc: BaseException) -> str:
+        code = getattr(exc, "code", None)
+        reason = getattr(exc, "reason", None)
+        if code is not None:
+            if reason:
+                return f"{type(exc).__name__}: {exc} (code={code}, reason={reason})"
+            return f"{type(exc).__name__}: {exc} (code={code})"
+        return f"{type(exc).__name__}: {exc}"
+
+    async def _close_ws(self) -> None:
+        async with self._lock:
+            ws = getattr(self._feed, "ws", None)
+            if ws is not None:
+                try:
+                    await ws.close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            with contextlib.suppress(Exception):
+                self._feed.ws = None  # type: ignore[attr-defined]
+
+    def _note_ws_disconnect(self, exc: BaseException) -> None:
+        self._reconnect_attempt = min(self._reconnect_attempt + 1, 16)
+        delay_s = self._next_reconnect_delay_s()
+        desc = self._describe_disconnect(exc)
+        self.last_error = (
+            f"Marketfeed disconnected ({desc}). "
+            f"Retrying websocket in {delay_s:.2f}s (attempt {self._reconnect_attempt}). "
+            f"Using REST LTP polling every {self._rest_poll_interval_s:.0f}s meanwhile."
+        )
+
+        now = time.monotonic()
+        if now - self._last_disconnect_log_ts >= 5.0:
+            self._last_disconnect_log_ts = now
+            log.warning("%s", self.last_error)
+
+    async def _reconnect_loop(self) -> None:
+        try:
+            while not self._closing:
+                delay_s = self._next_reconnect_delay_s()
+                await asyncio.sleep(delay_s)
+                if self._closing:
+                    return
+                try:
+                    await self.connect()
+                    # Success: reset and clear error.
+                    self._reconnect_attempt = 0
+                    self.last_error = None
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._note_ws_disconnect(e)
+                    await self._close_ws()
+        finally:
+            self._reconnect_task = None
+
+    def _ensure_reconnect(self) -> None:
+        if self._closing:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop(), name="dhan_ws_reconnect")
+
+    def notify_ws_error(self, exc: BaseException) -> None:
+        self._note_ws_disconnect(exc)
+        self._ensure_reconnect()
+
+    @staticmethod
+    def _exchange_segment_str(exchange_segment: int) -> Optional[str]:
+        return {
+            0: "IDX_I",
+            1: "NSE_EQ",
+            2: "NSE_FNO",
+            3: "NSE_CURRENCY",
+            4: "BSE_EQ",
+            5: "MCX_COMM",
+            7: "BSE_CURRENCY",
+            8: "BSE_FNO",
+        }.get(int(exchange_segment))
+
+    async def _poll_rest_into_buffer(self) -> None:
+        now = time.monotonic()
+        if self._rest_buffer:
+            return
+        if now < self._rest_next_poll_ts:
+            await asyncio.sleep(max(0.0, self._rest_next_poll_ts - now))
+        self._rest_next_poll_ts = time.monotonic() + self._rest_poll_interval_s
+
+        instruments = getattr(self._feed, "instruments", None) or []
+        wanted: list[tuple[int, str]] = []
+        for tup in instruments:
+            if not isinstance(tup, tuple) or len(tup) < 2:
+                continue
+            ex = tup[0]
+            secid = tup[1]
+            try:
+                ex_i = int(ex)
+            except Exception:
+                continue
+            wanted.append((ex_i, str(secid)))
+        # Prefer emitting spot ticks early to keep the strategy moving.
+        wanted.sort(key=lambda x: (0 if x[1] == self._spot_security_id else 1, x[0], x[1]))
+        if not wanted:
+            return
+
+        payload: dict[str, list[int]] = {}
+        for ex_i, secid in wanted:
+            ex_s = self._exchange_segment_str(ex_i)
+            if not ex_s:
+                continue
+            try:
+                secid_i = int(secid)
+            except Exception:
+                continue
+            payload.setdefault(ex_s, []).append(secid_i)
+
+        if not payload:
+            return
+
+        async def _call_rest(method_name: str, pl: dict[str, list[int]]) -> dict:
+            fn = getattr(self._rest, method_name)
+            return await asyncio.wait_for(asyncio.to_thread(fn, pl), timeout=12.0)
+
+        try:
+            resp = await _call_rest("ticker_data", payload)
+        except TimeoutError:
+            self.last_error = "REST LTP polling failed: timeout"
+            return
+        except Exception as e:
+            self.last_error = f"REST LTP polling failed: {self._describe_disconnect(e)}"
+            return
+
+        if not isinstance(resp, dict) or resp.get("status") != "success":
+            self.last_error = f"REST LTP polling failed: {resp.get('remarks') if isinstance(resp, dict) else resp}"
+            return
+
+        data = resp.get("data")
+        if isinstance(data, dict) and "data" in data:
+            data = data.get("data")
+
+        requested_exchange_keys = set(payload.keys())
+        found: dict[tuple[str, str], float] = {}
+
+        def walk(node, current_exchange: Optional[str] = None) -> None:
+            if isinstance(node, dict):
+                ex = current_exchange
+                ex_val = node.get("exchangeSegment") or node.get("exchange_segment") or node.get("ExchangeSegment")
+                if isinstance(ex_val, str) and ex_val in requested_exchange_keys:
+                    ex = ex_val
+                elif isinstance(ex_val, int):
+                    ex_s = self._exchange_segment_str(ex_val)
+                    if ex_s is not None:
+                        ex = ex_s
+
+                # If dict contains exchange buckets (e.g. {"IDX_I": [...]})
+                for k, v in node.items():
+                    # Pattern: {"NSE_FNO": {"49081": {"ltp": 10.5}}}
+                    if ex is not None and (isinstance(k, int) or (isinstance(k, str) and k.isdigit())) and isinstance(v, dict):
+                        ltp_val = (
+                            v.get("LTP")
+                            or v.get("ltp")
+                            or v.get("last_price")
+                            or v.get("lastPrice")
+                            or v.get("last_traded_price")
+                            or v.get("lastTradedPrice")
+                        )
+                        if ltp_val is not None:
+                            try:
+                                found[(ex, str(k))] = float(ltp_val)
+                            except Exception:
+                                pass
+
+                    if isinstance(k, str) and k in requested_exchange_keys:
+                        walk(v, k)
+                    else:
+                        walk(v, ex)
+
+                secid_val = (
+                    node.get("securityId")
+                    or node.get("security_id")
+                    or node.get("SecurityId")
+                    or node.get("SecurityID")
+                )
+                ltp_val = (
+                    node.get("LTP")
+                    or node.get("ltp")
+                    or node.get("last_price")
+                    or node.get("lastPrice")
+                    or node.get("last_traded_price")
+                    or node.get("lastTradedPrice")
+                )
+                if secid_val is not None and ltp_val is not None and ex is not None:
+                    try:
+                        found[(ex, str(secid_val))] = float(ltp_val)
+                    except Exception:
+                        pass
+            elif isinstance(node, list):
+                for it in node:
+                    walk(it, current_exchange)
+
+        walk(data)
+
+        # If spot isn't present, try quote endpoint (sometimes differs by segment / permissions).
+        spot_ex = self._exchange_segment_str(IDX)
+        if spot_ex and self._spot_security_id and (spot_ex, self._spot_security_id) not in found:
+            try:
+                spot_id = int(self._spot_security_id)
+            except Exception:
+                spot_id = None
+            if spot_id is not None:
+                try:
+                    qresp = await _call_rest("quote_data", {spot_ex: [spot_id]})
+                except Exception:
+                    qresp = None
+                if isinstance(qresp, dict) and qresp.get("status") == "success":
+                    qdata = qresp.get("data")
+                    if isinstance(qdata, dict) and "data" in qdata:
+                        qdata = qdata.get("data")
+                    walk(qdata)
+
+        for ex_i, secid in wanted:
+            ex_s = self._exchange_segment_str(ex_i)
+            if not ex_s:
+                continue
+            ltp = found.get((ex_s, secid))
+            if ltp is None:
+                ltp = found.get((ex_s, str(int(secid)))) if secid.isdigit() else None
+            if ltp is None:
+                continue
+            self._rest_buffer.append(
+                {
+                    "exchange_segment": ex_i,
+                    "security_id": secid,
+                    "LTP": ltp,
+                }
+            )
+
     async def recv_tick(self) -> Optional[FeedTick]:
-        data = await self._feed.get_instrument_data()
+        ws = getattr(self._feed, "ws", None)
+        if ws is not None and not getattr(ws, "closed", False):
+            try:
+                data = await self._feed.get_instrument_data()
+            except Exception as e:
+                try:
+                    from websockets.exceptions import ConnectionClosed
+                except Exception:
+                    ConnectionClosed = ()  # type: ignore[assignment]
+
+                is_ws_attr_error = isinstance(e, AttributeError) and ("recv" in str(e) or "ws" in str(e))
+                if isinstance(e, ConnectionClosed) or isinstance(e, OSError) or is_ws_attr_error:
+                    self._note_ws_disconnect(e)
+                    await self._close_ws()
+                    self._ensure_reconnect()
+                    data = None
+                else:
+                    raise
+        else:
+            data = None
+            self._ensure_reconnect()
+
+        if data is None:
+            await self._poll_rest_into_buffer()
+            if not self._rest_buffer:
+                return None
+            data = self._rest_buffer.pop(0)
+
         if not isinstance(data, dict):
             return None
         if "LTP" not in data or "security_id" not in data or "exchange_segment" not in data:

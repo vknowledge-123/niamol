@@ -25,6 +25,8 @@ def main() -> None:
         cfg = r.json()
         assert "strike_step" in cfg
         assert "start_preference" in cfg
+        assert "weekly_expiry" in cfg
+        assert "max_adds" in cfg
 
         cfg["trading_enabled"] = False
         cfg["start_preference"] = "CALL"
@@ -37,9 +39,24 @@ def main() -> None:
 
         r = client.get("/api/engine/status")
         assert r.status_code == 200, r.text
+        st = r.json()
+        assert "engine_kind" in st
+        assert "position" in st
+        assert "adds_done" in st
+        assert "max_adds" in st
+        assert "weekly_expiry" in st
 
         r = client.post("/api/engine/start")
         assert r.status_code == 400, r.text  # expected without instruments/credentials
+
+        r = client.post("/api/engine/squareoff_stop")
+        assert r.status_code == 400, r.text  # expected when engine not running
+
+        r = client.get("/api/sell/engine/status")
+        assert r.status_code == 200, r.text
+
+        r = client.post("/api/sell/engine/squareoff_stop")
+        assert r.status_code == 400, r.text  # expected when engine not running
 
     print("SMOKE OK")
 

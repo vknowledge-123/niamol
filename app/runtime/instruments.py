@@ -32,7 +32,7 @@ class InstrumentStore:
 
     We keep a tiny in-memory index for:
     - NIFTY spot security id (defaults to 13; can also be found in CSV)
-    - NIFTY weekly options (nearest weekly expiry >= now)
+    - NIFTY index options by nearest expiry date (Dhan mixes "W"/"M" flags)
     """
 
     CSV_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -86,7 +86,10 @@ class InstrumentStore:
                         exch == "NSE"
                         and seg == "D"
                         and instr == "OPTIDX"
-                        and exp_flag == "W"
+                        # Dhan marks many weekly series as "W", but some near-week expiries
+                        # appear as "M" in the scrip master. We include both and then
+                        # select by nearest expiry date.
+                        and exp_flag in ("W", "M")
                         and tsym.startswith("NIFTY-")
                     ):
                         weekly_rows.append(row)
@@ -107,6 +110,16 @@ class InstrumentStore:
         strike: int,
         option_type: Literal["CE", "PE"],
     ) -> OptionContract:
+        return await self.get_weekly_option(now_ist=now_ist, strike=strike, option_type=option_type, expiry_offset=0)
+
+    async def get_weekly_option(
+        self,
+        *,
+        now_ist: datetime,
+        strike: int,
+        option_type: Literal["CE", "PE"],
+        expiry_offset: int = 0,
+    ) -> OptionContract:
         if now_ist.tzinfo is None:
             raise ValueError("now_ist must be timezone-aware (IST).")
 
@@ -114,20 +127,34 @@ class InstrumentStore:
             if not self._loaded:
                 raise RuntimeError("Instrument master not loaded. Refresh instruments first.")
 
-            nearest_expiry: Optional[datetime] = None
+            expiry_offset_i = int(expiry_offset)
+            if expiry_offset_i < 0:
+                expiry_offset_i = 0
+
+            expiries: list[datetime] = []
             for row in self._weekly_rows:
                 exp_s = row.get("SEM_EXPIRY_DATE") or ""
                 try:
                     exp = datetime.strptime(exp_s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
                 except ValueError:
                     continue
-                if exp >= now_ist and (nearest_expiry is None or exp < nearest_expiry):
-                    nearest_expiry = exp
+                # Treat the expiry as valid for the entire calendar day.
+                # Dhan's CSV timestamps (e.g. 14:30:00) don't always align with the
+                # practical "tradeable until end-of-session" behavior.
+                if exp.date() >= now_ist.date():
+                    expiries.append(exp)
 
-            if nearest_expiry is None:
+            if not expiries:
                 raise RuntimeError("No weekly expiry >= now found in scrip master.")
 
-            expiry_iso = nearest_expiry.isoformat()
+            expiries = sorted(set(expiries))
+            if expiry_offset_i >= len(expiries):
+                raise RuntimeError(
+                    f"Weekly expiry offset={expiry_offset_i} out of range (available={len(expiries)} from now)."
+                )
+            chosen_expiry = expiries[expiry_offset_i]
+
+            expiry_iso = chosen_expiry.isoformat()
             key = (expiry_iso, strike, option_type)
             cached = self._weekly_cache.get(key)
             if cached:
@@ -140,7 +167,7 @@ class InstrumentStore:
                     exp = datetime.strptime(exp_s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
                 except ValueError:
                     continue
-                if exp != nearest_expiry:
+                if exp != chosen_expiry:
                     continue
 
                 tsym = row.get("SEM_TRADING_SYMBOL") or ""
@@ -173,7 +200,7 @@ class InstrumentStore:
                 break
 
             if chosen is None:
-                raise RuntimeError(f"Weekly option not found for strike={strike} {option_type} at {nearest_expiry}.")
+                raise RuntimeError(f"Weekly option not found for strike={strike} {option_type} at {chosen_expiry}.")
 
             self._weekly_cache[key] = chosen
             return chosen

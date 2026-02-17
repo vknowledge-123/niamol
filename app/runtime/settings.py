@@ -27,6 +27,9 @@ class EngineConfig(BaseModel):
     # Strike selection
     strike_step: int = 100
 
+    # Weekly expiry selection for option contracts.
+    weekly_expiry: Literal["CURRENT", "NEXT"] = "CURRENT"
+
     # Ladder parameters (in NIFTY spot points)
     add_step_points: int = 10
     target_points: int = 50
@@ -39,6 +42,7 @@ class EngineConfig(BaseModel):
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     limit_price_offset: float = 0.0
     lots_per_add: int = 1
+    max_adds: int = 0  # 0 = unlimited
 
     # Dhan instrument ids (optional overrides)
     nifty_spot_security_id: str = "13"
@@ -46,6 +50,8 @@ class EngineConfig(BaseModel):
 
 class EngineStatus(BaseModel):
     running: bool
+    engine_kind: Optional[str] = None  # BUY / SELL
+    position: Optional[str] = None  # LONG / SHORT
     trading_enabled: bool
     mode: str
     active_ladder: Optional[str]
@@ -54,8 +60,19 @@ class EngineStatus(BaseModel):
     stop_spot: Optional[float]
     next_add_spot: Optional[float]
     lots_open: int
+    adds_done: int = 0
+    max_adds: int = 0
     loss_count: int
     day_locked: bool
+    active_contract_symbol: Optional[str] = None
+    active_contract_security_id: Optional[str] = None
+    active_option_ltp: Optional[float] = None
+    active_contract_expiry: Optional[str] = None
+    active_contract_strike: Optional[int] = None
+    active_contract_option_type: Optional[str] = None
+    active_contract_lot_size: Optional[int] = None
+    active_qty: Optional[int] = None
+    weekly_expiry: Optional[str] = None
     last_error: Optional[str] = None
 
 

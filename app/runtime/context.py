@@ -13,10 +13,11 @@ class AppContext:
         self.config_store = EngineConfigStore()
         self.instruments = InstrumentStore()
         self.engine = EngineController(self.config_store, self.instruments)
+        self.sell_engine = EngineController(self.config_store, self.instruments, kind="SELL")
 
     async def startup(self) -> None:
         await self.instruments.load_from_disk_if_present()
 
     async def shutdown(self) -> None:
         await self.engine.stop()
-
+        await self.sell_engine.stop()
