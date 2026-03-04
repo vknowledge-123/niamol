@@ -31,6 +31,15 @@ async def stop_sell_engine(request: Request) -> EngineStatus:
 async def sell_engine_status(request: Request) -> EngineStatus:
     return await request.app.state.ctx.sell_engine.status()
 
+
+@router.post("/sell/engine/unlock_day", response_model=EngineStatus)
+async def sell_engine_unlock_day(request: Request) -> EngineStatus:
+    ctx = request.app.state.ctx
+    try:
+        return await ctx.sell_engine.unlock_day()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
 @router.post("/sell/engine/squareoff_flip", response_model=EngineStatus)
 async def sell_engine_squareoff_flip(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx

@@ -93,9 +93,14 @@ class EngineController:
         self._sim_trades: list[_SimTrade] = []
         self._sim_active: Optional[_SimTrade] = None
 
+        # Live MTM tracking (best-effort; based on option LTP ticks, not broker fills).
+        self._mtm_active: Optional[_SimTrade] = None
+
         # Cached config override to allow simulation even when config.trading_enabled is false.
         self._sim_cfg_ver: int = -1
         self._sim_cfg_override: Optional[EngineConfig] = None
+
+        # Premium-driven ladder management is handled by StrategyEngine; controller keeps no P&L exit rules.
 
     @property
     def kind(self) -> EngineKind:
@@ -172,11 +177,13 @@ class EngineController:
                 self._engine.reset_day()
                 self._active_contract = None
                 self._option_ltps.clear()
+                self._mtm_active = None
                 self._run_mode = mode
                 if mode == "SIM":
                     self._sim_seq = 0
                     self._sim_trades.clear()
                     self._sim_active = None
+                    self._mtm_active = None
 
                 self._running = True
                 self._lat.inc("engine_start")
@@ -200,22 +207,31 @@ class EngineController:
                 raise RuntimeError(self._last_error) from e
 
     async def stop(self) -> None:
+        current = asyncio.current_task()
         async with self._lock:
             self._running = False
             self._run_mode = None
             self._feed_error = None
 
+
         if self._market_task:
-            self._market_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._market_task
-            self._market_task = None
+            if self._market_task is current:
+                # Avoid awaiting on ourselves (can happen on internal stops triggered by the market loop).
+                self._market_task = None
+            else:
+                self._market_task.cancel()
+                with contextlib.suppress(Exception):
+                    await self._market_task
+                self._market_task = None
 
         if self._orders_task:
-            self._orders_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._orders_task
-            self._orders_task = None
+            if self._orders_task is current:
+                self._orders_task = None
+            else:
+                self._orders_task.cancel()
+                with contextlib.suppress(Exception):
+                    await self._orders_task
+                self._orders_task = None
 
         if self._feed:
             with contextlib.suppress(Exception):
@@ -224,6 +240,7 @@ class EngineController:
 
         self._active_contract = None
         self._option_ltps.clear()
+        self._mtm_active = None
         self._lat.inc("engine_stop")
 
     async def status(self) -> EngineStatus:
@@ -269,8 +286,29 @@ class EngineController:
             active_contract_lot_size=None if active_contract is None else int(active_contract.lot_size),
             active_qty=active_qty,
             weekly_expiry=str(getattr(cfg, "weekly_expiry", "CURRENT") or "CURRENT"),
+            entry_premium=self._engine.entry_premium,
+            stop_premium=self._engine.stop_premium,
+            next_add_premium=self._engine.next_add_premium,
             last_error=err,
         )
+
+    async def unlock_day(self) -> EngineStatus:
+        """
+        Clears the day-lock (including target lock) without stopping the engine.
+        Intended for discretionary "trade further" workflows after a target is hit.
+        """
+        if not self._running:
+            raise RuntimeError("Engine not running.")
+
+        async with self._market_lock:
+            if not self._engine.day_locked:
+                raise RuntimeError("Engine is not day-locked.")
+            self._engine.force_unlock_day()
+            # Best-effort cleanup of any stale local state after a close+lock cycle.
+            self._active_contract = None
+            self._option_ltps.clear()
+
+        return await self.status()
 
     async def square_off_and_flip(self) -> EngineStatus:
         """
@@ -329,6 +367,7 @@ class EngineController:
                             now=now,
                         )
             self._engine.reset_day()
+            self._mtm_active = None
 
         await self.stop()
         return await self.status()
@@ -499,6 +538,39 @@ class EngineController:
                         self._option_ltps[feed_tick.security_id] = feed_tick.ltp
                         if self._run_mode == "SIM":
                             self._sim_on_option_tick(feed_tick.security_id, feed_tick.ltp)
+                        elif self._mtm_active is not None:
+                            # Best-effort fill of pending entry premiums for live MTM tracking.
+                            for tr in (self._mtm_active,):
+                                if tr.contract.security_id != feed_tick.security_id:
+                                    continue
+                                filled = 0
+                                for f in tr.fills:
+                                    if f.premium is None:
+                                        f.premium = float(feed_tick.ltp)
+                                        filled += 1
+                                        if filled >= 3:
+                                            break
+
+                        # Premium-driven ladder management: only act on ticks for the active contract.
+                        active_contract = self._active_contract
+                        if active_contract is not None and str(feed_tick.security_id) == str(active_contract.security_id):
+                            last_spot = self._engine.last_tick
+                            if last_spot is not None:
+                                t_s0 = self._lat.now_ns() if sample else 0
+                                actions = self._engine.on_option_tick(
+                                    premium_ltp=float(feed_tick.ltp),
+                                    spot_ltp=float(last_spot.ltp),
+                                    cfg=cfg_eng,
+                                )
+                                t_s1 = self._lat.now_ns() if sample else 0
+                                if sample:
+                                    self._lat.add_ns("strategy_on_option_tick", t_s1 - t_s0)
+
+                                t_h0 = self._lat.now_ns() if sample else 0
+                                await self._handle_actions(actions, spot=float(last_spot.ltp), cfg=cfg_eng, now=now)
+                                t_h1 = self._lat.now_ns() if sample else 0
+                                if sample:
+                                    self._lat.add_ns("handle_actions_opt", t_h1 - t_h0)
                         if sample:
                             self._lat.add_ns("option_tick_total", self._lat.now_ns() - t_opt0)
                         self._lat.inc("option_ticks")
@@ -532,7 +604,7 @@ class EngineController:
             if isinstance(action, OpenLadder):
                 await self._open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
             elif isinstance(action, AddLot):
-                await self._add_lots(side=action.side, levels=action.levels, spot=action.spot, cfg=cfg)
+                await self._add_lots(side=action.side, levels=action.levels, spot=action.spot, cfg=cfg, now=now)
             elif isinstance(action, CloseLadder):
                 await self._close_ladder(
                     side=action.side,
@@ -645,7 +717,20 @@ class EngineController:
         await self._enqueue_orders([(txn, contract.security_id, qty, tag)], cfg=cfg)
         self._active_contract = contract
 
-    async def _add_lots(self, *, side: str, levels: int, spot: float, cfg) -> None:
+        if self._run_mode != "SIM":
+            prem = self._option_ltps.get(contract.security_id)
+            strategy_side = str(side)
+            trade_side = self._map_strategy_to_trade_side(strategy_side)
+            self._mtm_active = _SimTrade(
+                id=0,
+                side=self._display_side(strategy_side),
+                strategy_side=strategy_side,
+                trade_side=trade_side,
+                contract=contract,
+                fills=[_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem))],
+            )
+
+    async def _add_lots(self, *, side: str, levels: int, spot: float, cfg, now: datetime) -> None:
         if self._active_contract is None:
             return
         if levels <= 0:
@@ -654,6 +739,12 @@ class EngineController:
         txn = "BUY" if self._kind == "BUY" else "SELL"
         tag = f"add_{self._display_side(str(side)).lower()}"
         await self._enqueue_orders([(txn, self._active_contract.security_id, qty, tag)], cfg=cfg)
+
+        if self._run_mode != "SIM" and self._mtm_active is not None:
+            prem = self._option_ltps.get(self._active_contract.security_id)
+            self._mtm_active.fills.append(
+                _SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem))
+            )
 
     async def _close_ladder(
         self, *, side: str, spot: float, lots_open: int, reason: str, flip_to: Optional[str], cfg, now: datetime
@@ -676,6 +767,25 @@ class EngineController:
                 ops.append((close_txn, old_contract.security_id, old_qty, f"flip_close_{self._display_side(str(side)).lower()}"))
             await self._enqueue_orders(ops, cfg=cfg)
             self._active_contract = new_contract
+            if self._run_mode != "SIM":
+                prem = self._option_ltps.get(new_contract.security_id)
+                strategy_side = str(flip_to)
+                trade_side = self._map_strategy_to_trade_side(strategy_side)
+                self._mtm_active = _SimTrade(
+                    id=0,
+                    side=self._display_side(strategy_side),
+                    strategy_side=strategy_side,
+                    trade_side=trade_side,
+                    contract=new_contract,
+                    fills=[
+                        _SimFill(
+                            ts=now,
+                            spot=float(spot),
+                            qty=int(new_qty),
+                            premium=None if prem is None else float(prem),
+                        )
+                    ],
+                )
             return
 
         # Normal close (target / day lock / stop max losses)
@@ -685,6 +795,8 @@ class EngineController:
                 cfg=cfg,
             )
         self._active_contract = None
+        if self._run_mode != "SIM":
+            self._mtm_active = None
 
     async def _select_option_contract(self, *, side: str, spot: float, now: datetime, cfg) -> OptionContract:
         strike_step = int(cfg.strike_step)
@@ -698,13 +810,26 @@ class EngineController:
         ceil_strike = int(math.ceil(spot_f / strike_step) * strike_step)
 
         if self._kind == "BUY":
-            strike = floor_strike if trade_side == "CALL" else ceil_strike
-        else:
-            # SELL: strictly OTM.
+            # BUY: prefer ITM premium (strict ITM if spot is exactly on a strike).
             if trade_side == "CALL":
-                strike = ceil_strike if ceil_strike > spot_f else (ceil_strike + strike_step)
+                strike = floor_strike
+                if math.isclose(spot_f, float(strike), rel_tol=0.0, abs_tol=1e-9):
+                    strike = strike - strike_step
             else:
-                strike = floor_strike if floor_strike < spot_f else (floor_strike - strike_step)
+                strike = ceil_strike
+                if math.isclose(spot_f, float(strike), rel_tol=0.0, abs_tol=1e-9):
+                    strike = strike + strike_step
+        else:
+            # SELL: prefer ATM premium (nearest strike).
+            #
+            # Example for strike_step=100:
+            # - 25100..25150 -> 25100
+            # - 25151..25200 -> 25200
+            offset = spot_f - float(floor_strike)
+            if offset <= (strike_step / 2):
+                strike = floor_strike
+            else:
+                strike = ceil_strike
 
         opt_type = "CE" if trade_side == "CALL" else "PE"
 
@@ -779,6 +904,8 @@ class EngineController:
             tag = f"close_{self._display_side(str(side)).lower()}_{reason}"
             await self._enqueue_orders_and_wait([(close_txn, old_contract.security_id, old_qty, tag)], cfg=cfg)
         self._active_contract = None
+        if self._run_mode != "SIM":
+            self._mtm_active = None
 
     async def _execute_batch(self, batch: _OrderBatch) -> None:
         if self._rest is None:

@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Literal, Optional
 
+from pydantic import ConfigDict
 from pydantic import BaseModel, Field
 
 from app.runtime.paths import CONFIG_PATH
@@ -11,6 +12,8 @@ from app.runtime.persistence import read_json, write_json
 
 
 class EngineConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     client_id: Optional[str] = None
     access_token: Optional[str] = None
 
@@ -19,6 +22,10 @@ class EngineConfig(BaseModel):
     # Startup preference: when waiting for first breakout after engine start,
     # restrict to a specific ladder side or allow both.
     start_preference: Literal["AUTO", "CALL", "PUT"] = "AUTO"
+
+    # If enabled, bypass candle-breakout entry and start the first ladder immediately
+    # (uses `start_preference` to pick CALL/PUT; AUTO keeps normal breakout behavior).
+    instant_start: bool = False
 
     # Candle / entry
     timeframe_seconds: int = 60
@@ -30,11 +37,11 @@ class EngineConfig(BaseModel):
     # Weekly expiry selection for option contracts.
     weekly_expiry: Literal["CURRENT", "NEXT"] = "CURRENT"
 
-    # Ladder parameters (in NIFTY spot points)
-    add_step_points: int = 10
-    target_points: int = 50
-    trail_step_points: int = 10
-    initial_sl_points: int = 10
+    # Ladder parameters (in option premium points; allow decimals like 0.05)
+    add_step_points: float = 10.0
+    target_points: float = 50.0
+    trail_step_points: float = 10.0
+    initial_sl_points: float = 10.0
 
     max_losses_per_day: int = 5
 
@@ -73,6 +80,11 @@ class EngineStatus(BaseModel):
     active_contract_lot_size: Optional[int] = None
     active_qty: Optional[int] = None
     weekly_expiry: Optional[str] = None
+
+    # Premium-driven ladder tracking (best-effort; based on option LTP ticks).
+    entry_premium: Optional[float] = None
+    stop_premium: Optional[float] = None
+    next_add_premium: Optional[float] = None
     last_error: Optional[str] = None
 
 

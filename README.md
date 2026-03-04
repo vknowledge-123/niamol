@@ -8,6 +8,8 @@ FastAPI web app (not a desktop app) for running a 2-sided NIFTY options ladder s
 - Background 1-minute candle aggregator (spot ticks → 1m OHLC)
 - Breakout entry logic (2 green / 2 red candles), then **flip-flop ladder** (CALL ↔ PUT) on trailing SL / target
 - Instrument master downloader + weekly option selector from Dhan scrip-master CSV
+- Strike selection: BUY prefers ITM (strict ITM on exact strikes), SELL prefers ATM (nearest strike)
+- Optional `instant_start` toggle to bypass breakout and start the first ladder immediately
 
 ## Safety / reality checks
 - “Microseconds” end-to-end latency is not realistic in Python/Windows; this is **event-driven async** and avoids sleeps, but network + broker latency dominate.

@@ -57,16 +57,18 @@ Action: TypeAlias = OpenLadder | AddLot | CloseLadder
 class LadderState:
     side: LadderSide
     entry_spot: float
-    stop_spot: float
-    high_watermark: float
-    low_watermark: float
+    entry_premium: Optional[float]
+    stop_premium: Optional[float]
+    high_premium: Optional[float]
+    low_premium: Optional[float]
     next_add_level: int
     adds_done: int
     lots_open: int
 
 
 class StrategyEngine:
-    def __init__(self) -> None:
+    def __init__(self, *, kind: str = "BUY") -> None:
+        self._kind = "SELL" if str(kind).upper() == "SELL" else "BUY"
         self.mode: Mode = Mode.WAITING_BREAKOUT
         # Store a small rolling window; actual consecutive requirement is taken from config.
         self._candles: Deque[Candle] = deque(maxlen=20)
@@ -88,8 +90,7 @@ class StrategyEngine:
         After a ladder is running, a TSL/SL hit flips immediately without re-checking
         candle criteria (for both BUY and SELL engines).
         """
-        _ = kind
-        return cls()
+        return cls(kind=kind)
 
     @property
     def active_side(self) -> Optional[LadderSide]:
@@ -103,7 +104,8 @@ class StrategyEngine:
 
     @property
     def stop_spot(self) -> Optional[float]:
-        return None if self._ladder is None else self._ladder.stop_spot
+        # Spot-based stop levels are no longer used; trailing/target/add are premium-driven.
+        return None
 
     @property
     def lots_open(self) -> int:
@@ -115,16 +117,31 @@ class StrategyEngine:
 
     @property
     def next_add_spot(self) -> Optional[float]:
-        if self._ladder is None:
+        # Spot-based add levels are no longer used; trailing/target/add are premium-driven.
+        return None
+
+    @property
+    def entry_premium(self) -> Optional[float]:
+        return None if self._ladder is None else self._ladder.entry_premium
+
+    @property
+    def stop_premium(self) -> Optional[float]:
+        return None if self._ladder is None else self._ladder.stop_premium
+
+    @property
+    def next_add_premium(self) -> Optional[float]:
+        ladder = self._ladder
+        if ladder is None or ladder.entry_premium is None:
             return None
         cfg_add = self._last_cfg_add_step
         if cfg_add is None:
             return None
-        if self._ladder.side == "CALL":
-            return self._ladder.entry_spot + (self._ladder.next_add_level * cfg_add)
-        return self._ladder.entry_spot - (self._ladder.next_add_level * cfg_add)
+        entry = float(ladder.entry_premium)
+        if self._kind == "BUY":
+            return entry + (ladder.next_add_level * float(cfg_add))
+        return entry - (ladder.next_add_level * float(cfg_add))
 
-    _last_cfg_add_step: Optional[int] = None
+    _last_cfg_add_step: Optional[float] = None
 
     def reset_day(self) -> None:
         self.mode = Mode.WAITING_BREAKOUT
@@ -156,8 +173,30 @@ class StrategyEngine:
         self._started_once = False
         return True
 
+    def force_unlock_day(self) -> bool:
+        """
+        Manually unlock the day after a day-lock (e.g. after target or max-losses),
+        returning the engine to breakout monitoring.
+
+        Note: this does not change `loss_count`.
+        """
+        if not self.day_locked:
+            return False
+
+        self.day_locked = False
+        self.day_lock_reason = None
+        self.mode = Mode.WAITING_BREAKOUT
+        self._setup = None
+        self._candles.clear()
+        self._started_once = False
+        return True
+
     def on_candle(self, candle: Candle, cfg: EngineConfig) -> None:
         if self.day_locked or self._started_once:
+            return
+
+        if bool(getattr(cfg, "instant_start", False)) and getattr(cfg, "start_preference", "AUTO") in ("CALL", "PUT"):
+            # Instant-start bypasses candle breakout setup.
             return
 
         self._candles.append(candle)
@@ -197,6 +236,13 @@ class StrategyEngine:
 
         if self._ladder is None:
             self.mode = Mode.WAITING_BREAKOUT
+            if cfg.trading_enabled and bool(getattr(cfg, "instant_start", False)):
+                pref = getattr(cfg, "start_preference", "AUTO")
+                if pref in ("CALL", "PUT"):
+                    actions.append(OpenLadder(side=pref, spot=tick.ltp))
+                    self._open_ladder(side=pref, spot=tick.ltp, cfg=cfg)
+                    return actions
+
             setup = self._setup
             if setup is None or not cfg.trading_enabled:
                 return []
@@ -209,40 +255,64 @@ class StrategyEngine:
                 self._open_ladder(side="PUT", spot=tick.ltp, cfg=cfg)
             return actions
 
-        # Ladder running
+        # Ladder running: manage adds/stop/target on option premium ticks, not spot ticks.
         ladder = self._ladder
         self.mode = Mode.LADDER_CALL if ladder.side == "CALL" else Mode.LADDER_PUT
+        return []
 
-        favorable = (tick.ltp - ladder.entry_spot) if ladder.side == "CALL" else (ladder.entry_spot - tick.ltp)
+    def on_option_tick(self, *, premium_ltp: float, spot_ltp: float, cfg: EngineConfig) -> list[Action]:
+        """
+        Manage ladder lifecycle using option premium movement (adds, trailing stop, target).
+        """
+        if self.day_locked:
+            self.mode = Mode.DAY_LOCKED
+            return []
 
-        if favorable >= cfg.target_points:
-            actions.append(
-                CloseLadder(side=ladder.side, spot=tick.ltp, lots_open=ladder.lots_open, reason="target", flip_to=None)
-            )
+        ladder = self._ladder
+        if ladder is None:
+            self.mode = Mode.WAITING_BREAKOUT
+            return []
+
+        self.mode = Mode.LADDER_CALL if ladder.side == "CALL" else Mode.LADDER_PUT
+
+        prem = float(premium_ltp)
+        actions: list[Action] = []
+
+        if ladder.entry_premium is None:
+            ladder.entry_premium = prem
+            ladder.high_premium = prem
+            ladder.low_premium = prem
+            if self._kind == "BUY":
+                ladder.stop_premium = prem - float(cfg.initial_sl_points)
+            else:
+                ladder.stop_premium = prem + float(cfg.initial_sl_points)
+            return []
+
+        entry = float(ladder.entry_premium)
+        favorable = (prem - entry) if self._kind == "BUY" else (entry - prem)
+
+        if favorable >= float(cfg.target_points):
+            actions.append(CloseLadder(side=ladder.side, spot=float(spot_ltp), lots_open=ladder.lots_open, reason="target", flip_to=None))
             self._close_and_lock_day(reason="target")
             return actions
 
-        # Continuous trailing stop (watermark-based), tick-by-tick.
-        # CALL: track highest spot since entry -> stop = high - trail (updates on every new high)
-        # PUT: track lowest spot since entry -> stop = low + trail (updates on every new low)
-        trail = int(cfg.trail_step_points)
+        trail = float(cfg.trail_step_points)
         if trail > 0:
-            if ladder.side == "CALL":
-                if tick.ltp > ladder.high_watermark:
-                    ladder.high_watermark = tick.ltp
-                new_stop = float(ladder.high_watermark - trail)
-                if new_stop > ladder.stop_spot:
-                    ladder.stop_spot = new_stop
+            if self._kind == "BUY":
+                if ladder.high_premium is None or prem > float(ladder.high_premium):
+                    ladder.high_premium = prem
+                new_stop = float(ladder.high_premium) - trail
+                if ladder.stop_premium is None or new_stop > float(ladder.stop_premium):
+                    ladder.stop_premium = new_stop
             else:
-                if tick.ltp < ladder.low_watermark:
-                    ladder.low_watermark = tick.ltp
-                new_stop = float(ladder.low_watermark + trail)
-                if new_stop < ladder.stop_spot:
-                    ladder.stop_spot = new_stop
+                if ladder.low_premium is None or prem < float(ladder.low_premium):
+                    ladder.low_premium = prem
+                new_stop = float(ladder.low_premium) + trail
+                if ladder.stop_premium is None or new_stop < float(ladder.stop_premium):
+                    ladder.stop_premium = new_stop
 
-        # Pyramiding at each add_step_points in favorable direction
         if cfg.add_step_points > 0:
-            reached_level = int(favorable // cfg.add_step_points)
+            reached_level = int(favorable // float(cfg.add_step_points))
             if reached_level >= ladder.next_add_level:
                 planned_levels = reached_level - ladder.next_add_level + 1
                 max_adds = int(getattr(cfg, "max_adds", 0) or 0)
@@ -253,37 +323,42 @@ class StrategyEngine:
                 if levels_to_add > 0:
                     ladder.adds_done += int(levels_to_add)
                     ladder.lots_open += levels_to_add * cfg.lots_per_add
-                    actions.append(AddLot(side=ladder.side, spot=tick.ltp, levels=levels_to_add))
+                    actions.append(AddLot(side=ladder.side, spot=float(spot_ltp), levels=levels_to_add))
 
-        # Stop check
-        if ladder.side == "CALL" and tick.ltp <= ladder.stop_spot:
-            actions.extend(self._handle_stop_hit(exit_spot=tick.ltp, cfg=cfg))
-        elif ladder.side == "PUT" and tick.ltp >= ladder.stop_spot:
-            actions.extend(self._handle_stop_hit(exit_spot=tick.ltp, cfg=cfg))
+        stop = ladder.stop_premium
+        if stop is not None:
+            if self._kind == "BUY" and prem <= float(stop):
+                actions.extend(self._handle_stop_hit(exit_premium=prem, spot_ltp=float(spot_ltp), cfg=cfg))
+            elif self._kind == "SELL" and prem >= float(stop):
+                actions.extend(self._handle_stop_hit(exit_premium=prem, spot_ltp=float(spot_ltp), cfg=cfg))
 
         return actions
 
     def _open_ladder(self, *, side: LadderSide, spot: float, cfg: EngineConfig) -> None:
-        stop = (spot - cfg.initial_sl_points) if side == "CALL" else (spot + cfg.initial_sl_points)
         self._ladder = LadderState(
             side=side,
             entry_spot=spot,
-            stop_spot=stop,
-            high_watermark=spot,
-            low_watermark=spot,
+            entry_premium=None,
+            stop_premium=None,
+            high_premium=None,
+            low_premium=None,
             next_add_level=1,
             adds_done=0,
             lots_open=cfg.lots_per_add,
         )
+        self.mode = Mode.LADDER_CALL if side == "CALL" else Mode.LADDER_PUT
         self._setup = None
         self._started_once = True
 
-    def _handle_stop_hit(self, *, exit_spot: float, cfg: EngineConfig) -> list[Action]:
+    def _handle_stop_hit(self, *, exit_premium: float, spot_ltp: float, cfg: EngineConfig) -> list[Action]:
         ladder = self._ladder
         if ladder is None:
             return []
 
-        pnl_points = (exit_spot - ladder.entry_spot) if ladder.side == "CALL" else (ladder.entry_spot - exit_spot)
+        entry_prem = ladder.entry_premium
+        if entry_prem is None:
+            return []
+        pnl_points = (exit_premium - float(entry_prem)) if self._kind == "BUY" else (float(entry_prem) - exit_premium)
         is_loss = pnl_points <= 0
 
         new_loss_count = self.loss_count + (1 if is_loss else 0)
@@ -291,7 +366,7 @@ class StrategyEngine:
             self.loss_count = new_loss_count
             out = [
                 CloseLadder(
-                    side=ladder.side, spot=exit_spot, lots_open=ladder.lots_open, reason="stop_max_losses", flip_to=None
+                    side=ladder.side, spot=float(spot_ltp), lots_open=ladder.lots_open, reason="stop_max_losses", flip_to=None
                 )
             ]
             self._close_and_lock_day(reason="max_losses")
@@ -300,9 +375,9 @@ class StrategyEngine:
         self.loss_count = new_loss_count
         flip_to: LadderSide = "PUT" if ladder.side == "CALL" else "CALL"
         out = [
-            CloseLadder(side=ladder.side, spot=exit_spot, lots_open=ladder.lots_open, reason="stop_flip", flip_to=flip_to)
+            CloseLadder(side=ladder.side, spot=float(spot_ltp), lots_open=ladder.lots_open, reason="stop_flip", flip_to=flip_to)
         ]
-        self._open_ladder(side=flip_to, spot=exit_spot, cfg=cfg)
+        self._open_ladder(side=flip_to, spot=float(spot_ltp), cfg=cfg)
         return out
 
     def manual_square_off_and_flip(self, *, spot: float, cfg: EngineConfig) -> list[Action]:

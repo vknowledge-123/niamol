@@ -57,6 +57,15 @@ async def stop_engine(request: Request) -> EngineStatus:
 async def engine_status(request: Request) -> EngineStatus:
     return await request.app.state.ctx.engine.status()
 
+
+@router.post("/engine/unlock_day", response_model=EngineStatus)
+async def engine_unlock_day(request: Request) -> EngineStatus:
+    ctx = request.app.state.ctx
+    try:
+        return await ctx.engine.unlock_day()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
 @router.post("/engine/squareoff_flip", response_model=EngineStatus)
 async def engine_squareoff_flip(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx

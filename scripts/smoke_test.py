@@ -25,6 +25,7 @@ def main() -> None:
         cfg = r.json()
         assert "strike_step" in cfg
         assert "start_preference" in cfg
+        assert "instant_start" in cfg
         assert "weekly_expiry" in cfg
         assert "max_adds" in cfg
 
