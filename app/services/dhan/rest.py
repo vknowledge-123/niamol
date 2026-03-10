@@ -57,3 +57,26 @@ class DhanRest:
         ok = bool(raw) and not (isinstance(raw, dict) and raw.get("status") in ("failure", "error"))
         return PlacedOrder(ok=ok, raw=raw if isinstance(raw, dict) else {"response": raw})
 
+    def get_net_position_qty(self, *, security_id: str) -> int:
+        raw = self._dhan.get_positions()
+        if not isinstance(raw, dict) or raw.get("status") != "success":
+            raise RuntimeError(f"get_positions failed: {raw}")
+
+        data = raw.get("data")
+        rows = data if isinstance(data, list) else []
+        total = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            row_security_id = row.get("securityId") or row.get("security_id") or row.get("securityID")
+            if str(row_security_id or "") != str(security_id):
+                continue
+
+            net_qty = row.get("netQty")
+            if net_qty is None:
+                buy_qty = row.get("buyQty") or row.get("buyQuantity") or 0
+                sell_qty = row.get("sellQty") or row.get("sellQuantity") or 0
+                net_qty = float(buy_qty) - float(sell_qty)
+            total += int(float(net_qty))
+        return total

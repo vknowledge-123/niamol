@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Request
+
+from pydantic import BaseModel, Field
 
 from app.runtime.settings import EngineStatus
 
@@ -44,8 +48,7 @@ async def sell_engine_unlock_day(request: Request) -> EngineStatus:
 async def sell_engine_squareoff_flip(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx
     try:
-        # Backwards-compatible route: manual square-off now stops the engine (no flip).
-        return await ctx.sell_engine.square_off_and_stop()
+        return await ctx.sell_engine.square_off_and_flip()
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -61,3 +64,19 @@ async def sell_engine_squareoff_stop(request: Request) -> EngineStatus:
 @router.get("/sell/engine/latency")
 async def sell_engine_latency(request: Request) -> dict:
     return request.app.state.ctx.sell_engine.latency_snapshot()
+
+
+class OrderExecutionUpdate(BaseModel):
+    security_id: str = Field(..., min_length=1)
+    avg_price: float = Field(..., gt=0)
+    tag: Optional[str] = None
+
+
+@router.post("/sell/engine/order_execution", response_model=EngineStatus)
+async def sell_engine_order_execution(request: Request, upd: OrderExecutionUpdate) -> EngineStatus:
+    ctx = request.app.state.ctx
+    try:
+        await ctx.sell_engine.apply_order_execution(security_id=upd.security_id, avg_price=upd.avg_price, tag=upd.tag)
+        return await ctx.sell_engine.status()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e

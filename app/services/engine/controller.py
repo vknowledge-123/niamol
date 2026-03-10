@@ -95,6 +95,8 @@ class EngineController:
 
         # Live MTM tracking (best-effort; based on option LTP ticks, not broker fills).
         self._mtm_active: Optional[_SimTrade] = None
+        # Broker execution updates may arrive out-of-band; keep a small pending buffer keyed by security_id.
+        self._pending_exec_entry_premiums: dict[str, float] = {}
 
         # Cached config override to allow simulation even when config.trading_enabled is false.
         self._sim_cfg_ver: int = -1
@@ -334,7 +336,7 @@ class EngineController:
 
     async def square_off_and_stop(self) -> EngineStatus:
         """
-        Manual square-off for the current ladder (no flip), then stop the engine.
+        Manual square-off for the current ladder (no flip), then day-lock the engine.
         """
         if not self._running:
             raise RuntimeError("Engine not running.")
@@ -355,7 +357,7 @@ class EngineController:
             if self._run_mode == "SIM":
                 await self._handle_actions(actions, spot=float(tick.ltp), cfg=cfg_eng, now=now)
             else:
-                # For LIVE mode, ensure close order is executed before stopping the worker.
+                # For LIVE mode, ensure the broker close order is accepted before returning success.
                 for action in actions:
                     if isinstance(action, CloseLadder):
                         await self._manual_close_and_wait(
@@ -366,10 +368,7 @@ class EngineController:
                             cfg=cfg_eng,
                             now=now,
                         )
-            self._engine.reset_day()
-            self._mtm_active = None
 
-        await self.stop()
         return await self.status()
 
     def sim_trades(self, limit: int = 200) -> list[dict]:
@@ -461,6 +460,58 @@ class EngineController:
         snap["orders_queue_size"] = int(self._orders_q.qsize())
         snap["option_ltps_size"] = int(len(self._option_ltps))
         return snap
+
+    async def apply_order_execution(self, *, security_id: str, avg_price: float, tag: Optional[str] = None) -> None:
+        """
+        Apply broker execution (avg traded price) to MTM fills and strategy entry premium.
+
+        Intended to be called by an order-update websocket listener (external or future internal).
+        """
+        if not self._running:
+            raise RuntimeError("Engine not running.")
+
+        secid = str(security_id)
+        price = float(avg_price)
+        if price <= 0:
+            raise RuntimeError("avg_price must be > 0")
+
+        cfg = self._cfg_store.current()
+        cfg_eng = self._cfg_for_engine(cfg)
+
+        def _is_entry_tag(t: Optional[str]) -> bool:
+            if not t:
+                return True
+            return t.startswith("open_") or t.startswith("flip_open_")
+
+        def _is_add_tag(t: Optional[str]) -> bool:
+            return bool(t) and t.startswith("add_")
+
+        def _is_close_tag(t: Optional[str]) -> bool:
+            return bool(t) and (t.startswith("close_") or t.startswith("flip_close_"))
+
+        async with self._market_lock:
+            # Update MTM fill premiums for the active contract (best-effort).
+            if self._run_mode != "SIM" and self._mtm_active is not None and self._mtm_active.contract.security_id == secid:
+                if _is_add_tag(tag):
+                    for f in reversed(self._mtm_active.fills):
+                        if f.premium is None:
+                            f.premium = price
+                            break
+                else:
+                    for f in self._mtm_active.fills:
+                        if f.premium is None:
+                            f.premium = price
+                            break
+
+            # Strategy: apply executed entry premium for the active ladder only.
+            if self._active_contract is not None and self._active_contract.security_id == secid:
+                if not _is_close_tag(tag) and (_is_entry_tag(tag) or (not _is_add_tag(tag) and self._engine.adds_done == 0)):
+                    self._engine.apply_execution_entry_premium(premium=price, cfg=cfg_eng)
+                return
+
+            # Not currently active: buffer only probable entry executions (so open/flip can consume it).
+            if _is_entry_tag(tag) and not _is_close_tag(tag):
+                self._pending_exec_entry_premiums[secid] = price
 
     async def _market_loop(self) -> None:
         assert self._feed is not None
@@ -729,6 +780,11 @@ class EngineController:
                 contract=contract,
                 fills=[_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem))],
             )
+            pending = self._pending_exec_entry_premiums.pop(contract.security_id, None)
+            if pending is not None:
+                if self._mtm_active.fills and self._mtm_active.fills[0].premium is None:
+                    self._mtm_active.fills[0].premium = float(pending)
+                self._engine.apply_execution_entry_premium(premium=float(pending), cfg=cfg)
 
     async def _add_lots(self, *, side: str, levels: int, spot: float, cfg, now: datetime) -> None:
         if self._active_contract is None:
@@ -750,7 +806,7 @@ class EngineController:
         self, *, side: str, spot: float, lots_open: int, reason: str, flip_to: Optional[str], cfg, now: datetime
     ) -> None:
         old_contract = self._active_contract
-        old_qty = (max(1, old_contract.lot_size) * int(lots_open)) if old_contract else 0
+        old_qty = await self._resolve_close_qty(contract=old_contract, lots_open=lots_open)
         open_txn = "BUY" if self._kind == "BUY" else "SELL"
         close_txn = "SELL" if self._kind == "BUY" else "BUY"
 
@@ -786,6 +842,11 @@ class EngineController:
                         )
                     ],
                 )
+                pending = self._pending_exec_entry_premiums.pop(new_contract.security_id, None)
+                if pending is not None:
+                    if self._mtm_active.fills and self._mtm_active.fills[0].premium is None:
+                        self._mtm_active.fills[0].premium = float(pending)
+                    self._engine.apply_execution_entry_premium(premium=float(pending), cfg=cfg)
             return
 
         # Normal close (target / day lock / stop max losses)
@@ -820,16 +881,15 @@ class EngineController:
                 if math.isclose(spot_f, float(strike), rel_tol=0.0, abs_tol=1e-9):
                     strike = strike + strike_step
         else:
-            # SELL: prefer ATM premium (nearest strike).
-            #
-            # Example for strike_step=100:
-            # - 25100..25150 -> 25100
-            # - 25151..25200 -> 25200
-            offset = spot_f - float(floor_strike)
-            if offset <= (strike_step / 2):
-                strike = floor_strike
-            else:
+            # SELL: prefer strict OTM strikes based on the actual option being sold.
+            if trade_side == "CALL":
                 strike = ceil_strike
+                if math.isclose(spot_f, float(strike), rel_tol=0.0, abs_tol=1e-9):
+                    strike = strike + strike_step
+            else:
+                strike = floor_strike
+                if math.isclose(spot_f, float(strike), rel_tol=0.0, abs_tol=1e-9):
+                    strike = strike - strike_step
 
         opt_type = "CE" if trade_side == "CALL" else "PE"
 
@@ -898,7 +958,7 @@ class EngineController:
         self, *, side: str, spot: float, lots_open: int, reason: str, cfg, now: datetime
     ) -> None:
         old_contract = self._active_contract
-        old_qty = (max(1, old_contract.lot_size) * int(lots_open)) if old_contract else 0
+        old_qty = await self._resolve_close_qty(contract=old_contract, lots_open=lots_open)
         close_txn = "SELL" if self._kind == "BUY" else "BUY"
         if old_contract and old_qty > 0:
             tag = f"close_{self._display_side(str(side)).lower()}_{reason}"
@@ -906,6 +966,21 @@ class EngineController:
         self._active_contract = None
         if self._run_mode != "SIM":
             self._mtm_active = None
+
+    async def _resolve_close_qty(self, *, contract: Optional[OptionContract], lots_open: int) -> int:
+        if contract is None:
+            return 0
+
+        local_qty = max(1, contract.lot_size) * int(lots_open)
+        if self._run_mode != "LIVE" or self._rest is None:
+            return local_qty
+
+        try:
+            broker_qty = await asyncio.to_thread(self._rest.get_net_position_qty, security_id=contract.security_id)
+        except Exception as e:
+            log.warning("broker position lookup failed for secid=%s; using local qty=%s: %s", contract.security_id, local_qty, e)
+            return local_qty
+        return abs(int(broker_qty))
 
     async def _execute_batch(self, batch: _OrderBatch) -> None:
         if self._rest is None:
@@ -917,7 +992,9 @@ class EngineController:
             if qty <= 0:
                 return
 
-            order_type = cfg.order_type
+            # Dhan SDK supports LIMIT, but we currently always place MARKET orders for broker execution.
+            # If the UI/config is set to LIMIT, coerce to MARKET to avoid requiring option LTP ticks.
+            order_type = "MARKET" if cfg.order_type == "LIMIT" else cfg.order_type
             price = 0.0
             if order_type == "LIMIT":
                 ltp = self._option_ltps.get(str(secid))
@@ -947,6 +1024,7 @@ class EngineController:
                 self._last_error = f"order failed tag={tag} secid={secid} qty={qty} resp={placed.raw}"
                 log.warning("order failed (%.1fms): tag=%s secid=%s qty=%s resp=%s", dt_ms, tag, secid, qty, placed.raw)
                 self._lat.inc("order_fail")
+                raise RuntimeError(self._last_error)
             else:
                 log.debug("order ok (%.1fms): tag=%s secid=%s qty=%s", dt_ms, tag, secid, qty)
                 self._lat.inc("order_ok")

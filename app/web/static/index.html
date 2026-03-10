@@ -227,6 +227,23 @@
 
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="stepwise_trailing" type="checkbox" style="width:auto;" />
+                Step-wise trailing
+              </label>
+              <div class="small">If ON: SL trails in steps (cost at +1 trail step).</div>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="trade_direction_continue" type="checkbox" style="width:auto;" />
+                Trade direction continue
+              </label>
+              <div class="small">If ON: on TSL hit, re-enter same ladder side (no flip).</div>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
               <label>Max losses/day</label>
               <input id="max_losses_per_day" type="number" />
             </div>
@@ -455,7 +472,9 @@
         $("add_step_points").value = cfg.add_step_points ?? 10;
         $("target_points").value = cfg.target_points ?? 50;
         $("trail_step_points").value = cfg.trail_step_points ?? 10;
+        $("stepwise_trailing").checked = !!cfg.stepwise_trailing;
         $("initial_sl_points").value = cfg.initial_sl_points ?? 10;
+        $("trade_direction_continue").checked = !!cfg.trade_direction_continue;
         $("lots_per_add").value = cfg.lots_per_add ?? 1;
         $("max_losses_per_day").value = cfg.max_losses_per_day ?? 5;
         $("max_adds").value = cfg.max_adds ?? 0;
@@ -478,7 +497,9 @@
           add_step_points: Number($("add_step_points").value),
           target_points: Number($("target_points").value),
           trail_step_points: Number($("trail_step_points").value),
+          stepwise_trailing: !!$("stepwise_trailing").checked,
           initial_sl_points: Number($("initial_sl_points").value),
+          trade_direction_continue: !!$("trade_direction_continue").checked,
           lots_per_add: Number($("lots_per_add").value),
           max_losses_per_day: Number($("max_losses_per_day").value),
           max_adds: Number($("max_adds").value),
@@ -527,7 +548,7 @@
       async function squareOffStop() {
         const status = await apiJson(`${apiBase()}/engine/squareoff_stop`, { method: "POST" });
         renderStatus(status);
-        toast("Squared off", "Engine stopped", "good");
+        toast("Squared off", "Position closed and day locked", "good");
       }
 
       async function pollStatus() {

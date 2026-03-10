@@ -41,9 +41,15 @@ class EngineConfig(BaseModel):
     add_step_points: float = 10.0
     target_points: float = 50.0
     trail_step_points: float = 10.0
+    # If enabled, trailing SL moves in discrete steps:
+    # - BUY: after +1*trail => SL to cost; after +2*trail => SL to entry+trail; ...
+    # - SELL: after -1*trail => SL to cost; after -2*trail => SL to entry-trail; ...
+    stepwise_trailing: bool = False
     initial_sl_points: float = 10.0
 
     max_losses_per_day: int = 5
+    # If enabled, do not flip ladder direction on TSL/SL hit; re-enter same side instead.
+    trade_direction_continue: bool = False
 
     # Order params
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"

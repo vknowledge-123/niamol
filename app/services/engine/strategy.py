@@ -11,7 +11,7 @@ from app.services.market.models import Candle, SpotTick
 
 
 LadderSide = Literal["CALL", "PUT"]
-DayLockReason = Literal["target", "max_losses"]
+DayLockReason = Literal["target", "max_losses", "manual_squareoff"]
 
 
 class Mode(str, Enum):
@@ -142,6 +142,33 @@ class StrategyEngine:
         return entry - (ladder.next_add_level * float(cfg_add))
 
     _last_cfg_add_step: Optional[float] = None
+
+    def apply_execution_entry_premium(self, *, premium: float, cfg: EngineConfig) -> bool:
+        """
+        Set ladder entry premium from broker execution (avg traded price).
+
+        This is preferred over using the first option LTP tick as "entry".
+        """
+        if self.day_locked:
+            return False
+        ladder = self._ladder
+        if ladder is None:
+            return False
+
+        # Avoid changing the anchor after scaling in; it would invalidate add/TSL levels.
+        if ladder.entry_premium is not None and int(ladder.adds_done) > 0:
+            return False
+
+        prem = float(premium)
+        ladder.entry_premium = prem
+        ladder.high_premium = prem
+        ladder.low_premium = prem
+        ladder.next_add_level = 1
+        if self._kind == "BUY":
+            ladder.stop_premium = prem - float(cfg.initial_sl_points)
+        else:
+            ladder.stop_premium = prem + float(cfg.initial_sl_points)
+        return True
 
     def reset_day(self) -> None:
         self.mode = Mode.WAITING_BREAKOUT
@@ -298,18 +325,39 @@ class StrategyEngine:
 
         trail = float(cfg.trail_step_points)
         if trail > 0:
+            stepwise = bool(getattr(cfg, "stepwise_trailing", False))
             if self._kind == "BUY":
                 if ladder.high_premium is None or prem > float(ladder.high_premium):
                     ladder.high_premium = prem
-                new_stop = float(ladder.high_premium) - trail
-                if ladder.stop_premium is None or new_stop > float(ladder.stop_premium):
-                    ladder.stop_premium = new_stop
+
+                if stepwise:
+                    delta = float(ladder.high_premium) - entry
+                    levels = int(delta // trail)
+                    if levels >= 1:
+                        # +1*trail => SL to cost; +2*trail => SL to entry+trail; ...
+                        new_stop = entry + (levels - 1) * trail
+                        if ladder.stop_premium is None or new_stop > float(ladder.stop_premium):
+                            ladder.stop_premium = new_stop
+                else:
+                    new_stop = float(ladder.high_premium) - trail
+                    if ladder.stop_premium is None or new_stop > float(ladder.stop_premium):
+                        ladder.stop_premium = new_stop
             else:
                 if ladder.low_premium is None or prem < float(ladder.low_premium):
                     ladder.low_premium = prem
-                new_stop = float(ladder.low_premium) + trail
-                if ladder.stop_premium is None or new_stop < float(ladder.stop_premium):
-                    ladder.stop_premium = new_stop
+
+                if stepwise:
+                    delta = entry - float(ladder.low_premium)
+                    levels = int(delta // trail)
+                    if levels >= 1:
+                        # -1*trail => SL to cost; -2*trail => SL to entry-trail; ...
+                        new_stop = entry - (levels - 1) * trail
+                        if ladder.stop_premium is None or new_stop < float(ladder.stop_premium):
+                            ladder.stop_premium = new_stop
+                else:
+                    new_stop = float(ladder.low_premium) + trail
+                    if ladder.stop_premium is None or new_stop < float(ladder.stop_premium):
+                        ladder.stop_premium = new_stop
 
         if cfg.add_step_points > 0:
             reached_level = int(favorable // float(cfg.add_step_points))
@@ -373,6 +421,20 @@ class StrategyEngine:
             return out
 
         self.loss_count = new_loss_count
+        if bool(getattr(cfg, "trade_direction_continue", False)):
+            out = [
+                CloseLadder(
+                    side=ladder.side,
+                    spot=float(spot_ltp),
+                    lots_open=ladder.lots_open,
+                    reason="stop_continue",
+                    flip_to=None,
+                ),
+                OpenLadder(side=ladder.side, spot=float(spot_ltp)),
+            ]
+            self._open_ladder(side=ladder.side, spot=float(spot_ltp), cfg=cfg)
+            return out
+
         flip_to: LadderSide = "PUT" if ladder.side == "CALL" else "CALL"
         out = [
             CloseLadder(side=ladder.side, spot=float(spot_ltp), lots_open=ladder.lots_open, reason="stop_flip", flip_to=flip_to)
@@ -404,10 +466,7 @@ class StrategyEngine:
 
     def manual_square_off(self, *, spot: float) -> list[Action]:
         """
-        Manual square-off of the current ladder (no flip).
-
-        Intended to be used with an engine stop; we reset local ladder state
-        back to breakout monitoring.
+        Manual square-off of the current ladder (no flip), then day-lock.
         """
         ladder = self._ladder
         if ladder is None or self.day_locked:
@@ -422,11 +481,7 @@ class StrategyEngine:
                 flip_to=None,
             )
         ]
-        self.mode = Mode.WAITING_BREAKOUT
-        self._ladder = None
-        self._setup = None
-        self._candles.clear()
-        self._started_once = False
+        self._close_and_lock_day(reason="manual_squareoff")
         return out
 
     def _close_and_lock_day(self, *, reason: DayLockReason) -> None:
