@@ -19,4 +19,5 @@ def _base_data_dir() -> Path:
 
 APP_DATA_DIR = _base_data_dir() / "niftyalgo"
 CONFIG_PATH = APP_DATA_DIR / "config.json"
+BANK_CONFIG_PATH = APP_DATA_DIR / "banknifty_config.json"
 SCRIP_MASTER_PATH = APP_DATA_DIR / "dhan_scrip_master.csv"

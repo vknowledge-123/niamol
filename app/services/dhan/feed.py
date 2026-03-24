@@ -10,6 +10,8 @@ from typing import Optional
 
 import websockets
 from dhanhq import dhanhq as DhanHQ
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 
 def _patch_websockets_closed_attr() -> None:
@@ -37,6 +39,7 @@ _patch_websockets_closed_attr()
 from dhanhq.marketfeed import DhanFeed, IDX
 
 log = logging.getLogger("niftyalgo.dhan.feed")
+IST = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass(slots=True)
@@ -44,19 +47,29 @@ class FeedTick:
     exchange_segment: int
     security_id: str
     ltp: float
+    ts: Optional[datetime] = None  # timezone-aware (IST) when available
+    ltt: Optional[str] = None  # raw LTT as delivered by dhanhq (best-effort)
 
 
 class DhanMarketFeed:
-    def __init__(self, client_id: str, access_token: str, spot_security_id: str) -> None:
+    def __init__(self, client_id: str, access_token: str, spot_security_id: str | list[str]) -> None:
         self._client_id = client_id
         self._access_token = access_token
-        self._spot_security_id = str(spot_security_id)
+        if isinstance(spot_security_id, list):
+            spot_ids = [str(x) for x in spot_security_id if str(x)]
+        else:
+            spot_ids = [str(spot_security_id)]
+        if not spot_ids:
+            spot_ids = ["13"]
+        self._spot_security_id = str(spot_ids[0])
+        self._spot_security_ids = spot_ids
+        self._last_ltt_utc: Optional[datetime] = None
 
         # Default subscription: NIFTY spot
         self._feed = DhanFeed(
             client_id=self._client_id,
             access_token=self._access_token,
-            instruments=[(IDX, self._spot_security_id)],
+            instruments=[(IDX, sid) for sid in self._spot_security_ids],
             # Dhan v1 feed often rejects handshake (HTTP 400) on newer infra.
             # v2 uses token+clientId in the URL query and is more reliable.
             version="v2",
@@ -78,6 +91,38 @@ class DhanMarketFeed:
         self._rest_poll_interval_s: float = 1.0
         self._rest_next_poll_ts: float = 0.0
         self._rest_buffer: list[dict] = []
+
+    def _parse_ltt_to_ist(self, ltt: str) -> Optional[datetime]:
+        """
+        dhanhq ticker packets include 'LTT' as a UTC time-of-day string (HH:MM:SS),
+        derived from an epoch value but losing the date.
+
+        Reconstruct a best-effort UTC datetime by combining with today's UTC date
+        and applying a midnight wrap heuristic, then convert to IST.
+        """
+        s = str(ltt or "").strip()
+        if not s:
+            return None
+        try:
+            parts = s.split(":")
+            if len(parts) != 3:
+                return None
+            hh, mm, ss = (int(parts[0]), int(parts[1]), int(parts[2]))
+            now_utc = datetime.now(timezone.utc)
+            dt_utc = datetime(
+                now_utc.year, now_utc.month, now_utc.day, hh, mm, ss, tzinfo=timezone.utc
+            )
+            last = self._last_ltt_utc
+            if last is not None:
+                # If time-of-day goes backwards significantly, assume midnight rollover.
+                if dt_utc < last - timedelta(hours=12):
+                    dt_utc = dt_utc + timedelta(days=1)
+                elif dt_utc > last + timedelta(hours=12):
+                    dt_utc = dt_utc - timedelta(days=1)
+            self._last_ltt_utc = dt_utc
+            return dt_utc.astimezone(IST)
+        except Exception:
+            return None
 
     async def connect(self) -> None:
         async with self._lock:
@@ -430,8 +475,14 @@ class DhanMarketFeed:
             ltp = float(data["LTP"])
         except (TypeError, ValueError):
             return None
+        ltt = data.get("LTT")
+        ts = None
+        if ltt is not None:
+            ts = self._parse_ltt_to_ist(str(ltt))
         return FeedTick(
             exchange_segment=int(data["exchange_segment"]),
             security_id=str(data["security_id"]),
             ltp=ltp,
+            ts=ts,
+            ltt=None if ltt is None else str(ltt),
         )

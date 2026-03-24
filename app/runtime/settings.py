@@ -4,11 +4,41 @@ import asyncio
 from pathlib import Path
 from typing import Literal, Optional
 
+from pydantic import AliasChoices
 from pydantic import ConfigDict
 from pydantic import BaseModel, Field
 
 from app.runtime.paths import CONFIG_PATH
 from app.runtime.persistence import read_json, write_json
+
+
+class HybridLegConfig(BaseModel):
+    """
+    Hybrid engine overrides for a specific ladder leg (CALL/PUT x BUY/SELL).
+
+    If a field is None, HybridEngine falls back to the base EngineConfig value.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    lots_per_add: Optional[int] = None
+    max_adds: Optional[int] = None
+    target_points: Optional[float] = None
+    initial_tsl_points: Optional[float] = None
+    sequence_tsl_diff_points: Optional[float] = None
+
+
+class HybridConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    # Which ladder type to start with when hybrid engine starts.
+    # BUY = start with CALL_BUY/PUT_BUY; SELL = start with CALL_SELL/PUT_SELL.
+    execution_mode: Literal["BUY", "SELL"] = "BUY"
+
+    call_buy: HybridLegConfig = Field(default_factory=HybridLegConfig)
+    call_sell: HybridLegConfig = Field(default_factory=HybridLegConfig)
+    put_buy: HybridLegConfig = Field(default_factory=HybridLegConfig)
+    put_sell: HybridLegConfig = Field(default_factory=HybridLegConfig)
 
 
 class EngineConfig(BaseModel):
@@ -34,22 +64,57 @@ class EngineConfig(BaseModel):
     # Strike selection
     strike_step: int = 100
 
+    # Contract selection for option contracts.
+    contract_kind: Literal["WEEKLY", "MONTHLY"] = "WEEKLY"
+
     # Weekly expiry selection for option contracts.
     weekly_expiry: Literal["CURRENT", "NEXT"] = "CURRENT"
 
+    # Monthly expiry selection for option contracts.
+    # 0 = current monthly, 1 = next monthly, ...
+    monthly_expiry_offset: int = 0
+
     # Ladder parameters (in option premium points; allow decimals like 0.05)
-    add_step_points: float = 10.0
     target_points: float = 50.0
-    trail_step_points: float = 10.0
-    # If enabled, trailing SL moves in discrete steps:
-    # - BUY: after +1*trail => SL to cost; after +2*trail => SL to entry+trail; ...
-    # - SELL: after -1*trail => SL to cost; after -2*trail => SL to entry-trail; ...
-    stepwise_trailing: bool = False
-    initial_sl_points: float = 10.0
+
+    # Trailing SL / add sequencing (premium points)
+    #
+    # - initial_tsl_points: initial trailing distance at entry (BUY: entry - initial_tsl; SELL: entry + initial_tsl)
+    # - sequence_tsl_diff_points: each time an ADD triggers, increase the trailing distance by this amount.
+    #
+    # Adds are also derived from this sequence (no separate add-step setting):
+    # - BUY: next add triggers after cumulative favorable move of:
+    #        sum_{k=1..n}(initial_tsl + k*diff)
+    # - SELL: same, but downward (entry - cumulative)
+    initial_tsl_points: float = 10.0
+    sequence_tsl_diff_points: float = 1.0
+
+    # Candle-based trailing stop (spot) + candle-only adds (1-minute IST candles).
+    #
+    # When enabled:
+    # - CALL ladder stop trails to the previous 1m candle LOW (PCL).
+    # - PUT ladder stop trails to the previous 1m candle HIGH (PDH).
+    # - Lot additions happen only on 1m candle close (spot), with color/delta filters.
+    pcl_trailing: bool = False
+    pdh_trailing: bool = False
+    candle_add_min_points: float = 5.0
+    candle_stop_buffer_points: float = 2.5
 
     max_losses_per_day: int = 5
-    # If enabled, do not flip ladder direction on TSL/SL hit; re-enter same side instead.
+
+    # If enabled, always auto-flip ladder direction on TSL/SL hit (CALL <-> PUT).
+    # If disabled, behavior depends on `trade_direction_continue`:
+    # - If `trade_direction_continue` is ON: auto re-enter the same side.
+    # - Else: pause in `waiting_manual` and wait for user action (Flip opposite / Continue same).
+    full_automation: bool = False
+    # If enabled, on TSL/SL hit automatically re-enter the same ladder side (no flip).
+    # If disabled, on TSL/SL hit the engine pauses and waits for a manual decision
+    # (Flip opposite / Continue same from the UI).
     trade_direction_continue: bool = False
+
+    # If enabled, after the current ladder exits on target or TSL/stop,
+    # the controller stops the engine (no further trades until manual start).
+    last_trade: bool = False
 
     # Order params
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
@@ -57,13 +122,24 @@ class EngineConfig(BaseModel):
     lots_per_add: int = 1
     max_adds: int = 0  # 0 = unlimited
 
+    # If enabled, confirm close quantity using broker position lookup (slower, but can be more accurate).
+    # If disabled, square-off uses local qty derived from ladder state (ultra-low latency).
+    broker_qty_lookup: bool = False
+
     # Dhan instrument ids (optional overrides)
-    nifty_spot_security_id: str = "13"
+    spot_security_id: str = Field(
+        default="13",
+        validation_alias=AliasChoices("spot_security_id", "nifty_spot_security_id"),
+    )
+
+    # Hybrid engine settings (kept separate so existing BUY/SELL engines remain unchanged).
+    hybrid: HybridConfig = Field(default_factory=HybridConfig)
 
 
 class EngineStatus(BaseModel):
     running: bool
     engine_kind: Optional[str] = None  # BUY / SELL
+    underlying: Optional[str] = None  # NIFTY / BANKNIFTY
     position: Optional[str] = None  # LONG / SHORT
     trading_enabled: bool
     mode: str
@@ -85,7 +161,9 @@ class EngineStatus(BaseModel):
     active_contract_option_type: Optional[str] = None
     active_contract_lot_size: Optional[int] = None
     active_qty: Optional[int] = None
+    contract_kind: Optional[str] = None
     weekly_expiry: Optional[str] = None
+    monthly_expiry_offset: Optional[int] = None
 
     # Premium-driven ladder tracking (best-effort; based on option LTP ticks).
     entry_premium: Optional[float] = None
@@ -95,17 +173,18 @@ class EngineStatus(BaseModel):
 
 
 class EngineConfigStore:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, default_cfg: EngineConfig | None = None) -> None:
         self._lock = asyncio.Lock()
         self._path = path or CONFIG_PATH
+        self._default_cfg = default_cfg or EngineConfig()
         loaded = read_json(self._path)
         if loaded is not None:
             try:
                 self._cfg = EngineConfig.model_validate(loaded)
             except Exception:
-                self._cfg = EngineConfig()
+                self._cfg = self._default_cfg
         else:
-            self._cfg = EngineConfig()
+            self._cfg = self._default_cfg
         self._version = 0
 
     def current(self) -> EngineConfig:

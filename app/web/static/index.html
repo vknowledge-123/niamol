@@ -130,6 +130,7 @@
       }
       .toast.good{ border-left-color: var(--good); }
       .toast.bad{ border-left-color: var(--bad); }
+      .toast.warn{ border-left-color: var(--warn); }
       .toast .t{ color: var(--muted); font-size: 12px; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
       .small{ font-size: 12px; color: var(--muted); }
       @media (max-width: 980px){
@@ -154,7 +155,7 @@
       </header>
 
       <div class="grid">
-        <div class="card">
+        <div class="card" id="credentials_card">
           <h3>Credentials</h3>
           <label>Dhan Client ID</label>
           <input id="client_id" placeholder="e.g. 1100XXXX" />
@@ -167,7 +168,7 @@
           <div class="small">Tip: Use MARKET orders to start; LIMIT needs option LTP ticks first.</div>
         </div>
 
-        <div class="card">
+        <div class="card" id="strategy_single_card">
           <h3>Strategy</h3>
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
@@ -191,6 +192,13 @@
               <input id="strike_step" type="number" />
             </div>
             <div style="flex:1; min-width: 220px;">
+              <label>Contract</label>
+              <select id="contract_kind">
+                <option value="WEEKLY">Weekly</option>
+                <option value="MONTHLY">Monthly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
               <label>Weekly expiry</label>
               <select id="weekly_expiry">
                 <option value="CURRENT">Current weekly</option>
@@ -205,8 +213,12 @@
 
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
-              <label>Add step (premium points)</label>
-              <input id="add_step_points" type="number" step="0.05" />
+              <label>Initial TSL (premium points)</label>
+              <input id="initial_tsl_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Sequence TSL diff (premium points)</label>
+              <input id="sequence_tsl_diff_points" type="number" step="0.05" />
             </div>
             <div style="flex:1; min-width: 220px;">
               <label>Target (premium points)</label>
@@ -216,29 +228,53 @@
 
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
-              <label>Trail step (premium points)</label>
-              <input id="trail_step_points" type="number" step="0.05" />
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="pcl_trailing" type="checkbox" style="width:auto;" />
+                PCL trailing (1m candle)
+              </label>
+              <div class="small">CALL ladder: stop = previous 1m candle low (IST). Adds only on candle close (green + delta).</div>
             </div>
             <div style="flex:1; min-width: 220px;">
-              <label>Initial SL (premium points)</label>
-              <input id="initial_sl_points" type="number" step="0.05" />
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="pdh_trailing" type="checkbox" style="width:auto;" />
+                PDH trailing (1m candle)
+              </label>
+              <div class="small">PUT ladder: stop = previous 1m candle high (IST). Adds only on candle close (red + delta).</div>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle add min points</label>
+              <input id="candle_add_min_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle stop buffer points</label>
+              <input id="candle_stop_buffer_points" type="number" step="0.05" />
+              <div class="small">Buffer is applied to spot stop: CALL stop = low - buffer, PUT stop = high + buffer.</div>
             </div>
           </div>
 
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
               <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
-                <input id="stepwise_trailing" type="checkbox" style="width:auto;" />
-                Step-wise trailing
+                <input id="full_automation" type="checkbox" style="width:auto;" />
+                Full automation
               </label>
-              <div class="small">If ON: SL trails in steps (cost at +1 trail step).</div>
+              <div class="small">If ON: on TSL hit, ladder flips automatically. Overrides manual buttons.</div>
             </div>
             <div style="flex:1; min-width: 220px;">
               <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
                 <input id="trade_direction_continue" type="checkbox" style="width:auto;" />
                 Trade direction continue
               </label>
-              <div class="small">If ON: on TSL hit, re-enter same ladder side (no flip).</div>
+              <div class="small">If ON: on TSL hit, auto re-enter same ladder side. If OFF: wait for manual Flip opposite / Continue same.</div>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="last_trade" type="checkbox" style="width:auto;" />
+                Last trade (stop engine)
+              </label>
+              <div class="small">If ON: after target/TSL hit, engine stops (no further trades).</div>
             </div>
           </div>
 
@@ -262,20 +298,505 @@
 
           <label>Limit price offset</label>
           <input id="limit_price_offset" type="number" step="0.05" />
+
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="broker_qty_lookup" type="checkbox" style="width:auto;" />
+                Broker qty lookup (safe square-off)
+              </label>
+              <div class="small">If ON: square-off qty uses broker net position (slower, safer). If OFF: uses local ladder qty (faster).</div>
+            </div>
+          </div>
+
+          <div id="hybrid_cfg_wrap" style="display:none; margin-top: 14px;">
+            <h3 style="margin-top:0;">Hybrid settings</h3>
+            <div class="row2">
+              <div style="flex:1; min-width: 220px;">
+                <label>Execution mode</label>
+                <select id="hybrid_execution_mode">
+                  <option value="BUY">Buy mode first</option>
+                  <option value="SELL">Sell mode first</option>
+                </select>
+                <div class="small">Hybrid flips BUY⇄SELL on every TSL/stop hit (same contract), using per-leg settings below.</div>
+              </div>
+            </div>
+
+            <div class="tablewrap" style="margin-top: 10px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Leg</th>
+                    <th>Lots/add</th>
+                    <th>Initial TSL</th>
+                    <th>Seq diff</th>
+                    <th>Target</th>
+                    <th>Max adds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono">CALL_BUY</td>
+                    <td><input id="hybrid_call_buy_lots_per_add" type="number" /></td>
+                    <td><input id="hybrid_call_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">CALL_SELL</td>
+                    <td><input id="hybrid_call_sell_lots_per_add" type="number" /></td>
+                    <td><input id="hybrid_call_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_call_sell_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_BUY</td>
+                    <td><input id="hybrid_put_buy_lots_per_add" type="number" /></td>
+                    <td><input id="hybrid_put_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_SELL</td>
+                    <td><input id="hybrid_put_sell_lots_per_add" type="number" /></td>
+                    <td><input id="hybrid_put_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="hybrid_put_sell_max_adds" type="number" /></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="strategy_nifty_card" style="display:none;">
+          <h3>NIFTY Config</h3>
+          <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+            <input id="nifty_trading_enabled" type="checkbox" style="width:auto;" />
+            Trading enabled (NIFTY)
+          </label>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Start preference</label>
+              <select id="nifty_start_preference">
+                <option value="AUTO">AUTO (either side)</option>
+                <option value="CALL">CALL first</option>
+                <option value="PUT">PUT first</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Instant start</label>
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_instant_start" type="checkbox" style="width:auto;" />
+                Bypass candle breakout
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Strike step</label>
+              <input id="nifty_strike_step" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Contract</label>
+              <select id="nifty_contract_kind">
+                <option value="WEEKLY">Weekly</option>
+                <option value="MONTHLY">Monthly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Weekly expiry</label>
+              <select id="nifty_weekly_expiry">
+                <option value="CURRENT">Current weekly</option>
+                <option value="NEXT">Next weekly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Lots per add</label>
+              <input id="nifty_lots_per_add" type="number" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Initial TSL (premium points)</label>
+              <input id="nifty_initial_tsl_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Sequence TSL diff (premium points)</label>
+              <input id="nifty_sequence_tsl_diff_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Target (premium points)</label>
+              <input id="nifty_target_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_pcl_trailing" type="checkbox" style="width:auto;" />
+                PCL trailing (1m candle)
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_pdh_trailing" type="checkbox" style="width:auto;" />
+                PDH trailing (1m candle)
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle add min points</label>
+              <input id="nifty_candle_add_min_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle stop buffer points</label>
+              <input id="nifty_candle_stop_buffer_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_full_automation" type="checkbox" style="width:auto;" />
+                Full automation
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_trade_direction_continue" type="checkbox" style="width:auto;" />
+                Trade direction continue
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_last_trade" type="checkbox" style="width:auto;" />
+                Last trade (stop engine)
+              </label>
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Max losses/day</label>
+              <input id="nifty_max_losses_per_day" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Max adds</label>
+              <input id="nifty_max_adds" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Order type</label>
+              <select id="nifty_order_type">
+                <option value="MARKET">MARKET</option>
+                <option value="LIMIT">LIMIT</option>
+              </select>
+            </div>
+          </div>
+          <label>Limit price offset</label>
+          <input id="nifty_limit_price_offset" type="number" step="0.05" />
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_broker_qty_lookup" type="checkbox" style="width:auto;" />
+                Broker qty lookup (safe square-off)
+              </label>
+            </div>
+          </div>
+
+          <div id="nifty_hybrid_cfg_wrap" style="display:none; margin-top: 14px;">
+            <h3 style="margin-top:0;">Hybrid settings</h3>
+            <div class="row2">
+              <div style="flex:1; min-width: 220px;">
+                <label>Execution mode</label>
+                <select id="nifty_hybrid_execution_mode">
+                  <option value="BUY">Buy mode first</option>
+                  <option value="SELL">Sell mode first</option>
+                </select>
+              </div>
+            </div>
+            <div class="tablewrap" style="margin-top: 10px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Leg</th>
+                    <th>Lots/add</th>
+                    <th>Initial TSL</th>
+                    <th>Seq diff</th>
+                    <th>Target</th>
+                    <th>Max adds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono">CALL_BUY</td>
+                    <td><input id="nifty_hybrid_call_buy_lots_per_add" type="number" /></td>
+                    <td><input id="nifty_hybrid_call_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">CALL_SELL</td>
+                    <td><input id="nifty_hybrid_call_sell_lots_per_add" type="number" /></td>
+                    <td><input id="nifty_hybrid_call_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_call_sell_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_BUY</td>
+                    <td><input id="nifty_hybrid_put_buy_lots_per_add" type="number" /></td>
+                    <td><input id="nifty_hybrid_put_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_SELL</td>
+                    <td><input id="nifty_hybrid_put_sell_lots_per_add" type="number" /></td>
+                    <td><input id="nifty_hybrid_put_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="nifty_hybrid_put_sell_max_adds" type="number" /></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btn_reload_nifty" onclick="safe(loadNiftyConfig)">Reload NIFTY</button>
+            <button id="btn_save_nifty" class="btn-primary" onclick="safe(saveNiftyConfig)">Save NIFTY</button>
+          </div>
+        </div>
+
+        <div class="card" id="strategy_bank_card" style="display:none;">
+          <h3>BANKNIFTY Config</h3>
+          <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+            <input id="bank_trading_enabled" type="checkbox" style="width:auto;" />
+            Trading enabled (BANKNIFTY)
+          </label>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Start preference</label>
+              <select id="bank_start_preference">
+                <option value="AUTO">AUTO (either side)</option>
+                <option value="CALL">CALL first</option>
+                <option value="PUT">PUT first</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Instant start</label>
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_instant_start" type="checkbox" style="width:auto;" />
+                Bypass candle breakout
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Strike step</label>
+              <input id="bank_strike_step" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Contract</label>
+              <select id="bank_contract_kind">
+                <option value="WEEKLY">Weekly</option>
+                <option value="MONTHLY">Monthly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Weekly expiry</label>
+              <select id="bank_weekly_expiry">
+                <option value="CURRENT">Current weekly</option>
+                <option value="NEXT">Next weekly</option>
+              </select>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Lots per add</label>
+              <input id="bank_lots_per_add" type="number" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Initial TSL (premium points)</label>
+              <input id="bank_initial_tsl_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Sequence TSL diff (premium points)</label>
+              <input id="bank_sequence_tsl_diff_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Target (premium points)</label>
+              <input id="bank_target_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_pcl_trailing" type="checkbox" style="width:auto;" />
+                PCL trailing (1m candle)
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_pdh_trailing" type="checkbox" style="width:auto;" />
+                PDH trailing (1m candle)
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle add min points</label>
+              <input id="bank_candle_add_min_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Candle stop buffer points</label>
+              <input id="bank_candle_stop_buffer_points" type="number" step="0.05" />
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_full_automation" type="checkbox" style="width:auto;" />
+                Full automation
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_trade_direction_continue" type="checkbox" style="width:auto;" />
+                Trade direction continue
+              </label>
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_last_trade" type="checkbox" style="width:auto;" />
+                Last trade (stop engine)
+              </label>
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label>Max losses/day</label>
+              <input id="bank_max_losses_per_day" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Max adds</label>
+              <input id="bank_max_adds" type="number" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label>Order type</label>
+              <select id="bank_order_type">
+                <option value="MARKET">MARKET</option>
+                <option value="LIMIT">LIMIT</option>
+              </select>
+            </div>
+          </div>
+          <label>Limit price offset</label>
+          <input id="bank_limit_price_offset" type="number" step="0.05" />
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_broker_qty_lookup" type="checkbox" style="width:auto;" />
+                Broker qty lookup (safe square-off)
+              </label>
+            </div>
+          </div>
+
+          <div id="bank_hybrid_cfg_wrap" style="display:none; margin-top: 14px;">
+            <h3 style="margin-top:0;">Hybrid settings</h3>
+            <div class="row2">
+              <div style="flex:1; min-width: 220px;">
+                <label>Execution mode</label>
+                <select id="bank_hybrid_execution_mode">
+                  <option value="BUY">Buy mode first</option>
+                  <option value="SELL">Sell mode first</option>
+                </select>
+              </div>
+            </div>
+            <div class="tablewrap" style="margin-top: 10px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Leg</th>
+                    <th>Lots/add</th>
+                    <th>Initial TSL</th>
+                    <th>Seq diff</th>
+                    <th>Target</th>
+                    <th>Max adds</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono">CALL_BUY</td>
+                    <td><input id="bank_hybrid_call_buy_lots_per_add" type="number" /></td>
+                    <td><input id="bank_hybrid_call_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">CALL_SELL</td>
+                    <td><input id="bank_hybrid_call_sell_lots_per_add" type="number" /></td>
+                    <td><input id="bank_hybrid_call_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_call_sell_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_BUY</td>
+                    <td><input id="bank_hybrid_put_buy_lots_per_add" type="number" /></td>
+                    <td><input id="bank_hybrid_put_buy_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_buy_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_buy_target_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_buy_max_adds" type="number" /></td>
+                  </tr>
+                  <tr>
+                    <td class="mono">PUT_SELL</td>
+                    <td><input id="bank_hybrid_put_sell_lots_per_add" type="number" /></td>
+                    <td><input id="bank_hybrid_put_sell_initial_tsl_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_sell_sequence_tsl_diff_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_sell_target_points" type="number" step="0.05" /></td>
+                    <td><input id="bank_hybrid_put_sell_max_adds" type="number" /></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btn_reload_bank" onclick="safe(loadBankConfig)">Reload BANKNIFTY</button>
+            <button id="btn_save_bank" class="btn-primary" onclick="safe(saveBankConfig)">Save BANKNIFTY</button>
+          </div>
         </div>
 
         <div class="card" style="grid-column: span 12;">
           <h3>Controls & Status</h3>
           <div class="row2" style="align-items:center;">
-            <label style="display:flex;gap:10px;align-items:center;margin-top:0;min-width:240px;">
-              <input id="trading_enabled" type="checkbox" style="width:auto;" />
-              Trading enabled (config)
-            </label>
+            <div id="trading_enabled_wrap">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;min-width:240px;">
+                <input id="trading_enabled" type="checkbox" style="width:auto;" />
+                Trading enabled (config)
+              </label>
+            </div>
             <div style="min-width: 260px;">
               <label style="margin-top:0;">Engine type</label>
               <select id="engine_kind">
                 <option value="BUY">Option buying engine</option>
                 <option value="SELL">Option selling engine</option>
+                <option value="HYBRID">Hybrid engine</option>
+              </select>
+            </div>
+            <div style="min-width: 220px;">
+              <label style="margin-top:0;">Instrument mode</label>
+              <select id="instrument_mode">
+                <option value="NIFTY">NIFTY</option>
+                <option value="BANKNIFTY">BANKNIFTY</option>
+                <option value="BOTH">Both</option>
+              </select>
+            </div>
+            <div style="min-width: 220px;" id="active_instrument_wrap">
+              <label style="margin-top:0;">Active instrument</label>
+              <select id="active_instrument">
+                <option value="NIFTY">NIFTY</option>
+                <option value="BANKNIFTY">BANKNIFTY</option>
               </select>
             </div>
             <div class="actions" style="margin-top:0;">
@@ -284,6 +805,8 @@
               <button id="btn_start" class="btn-primary" onclick="safe(startEngine)">Start engine</button>
               <button id="btn_stop" class="btn-danger" onclick="safe(stopEngine)">Stop engine</button>
               <button id="btn_sqoff" class="btn-danger" onclick="safe(squareOffStop)">Square off (stop)</button>
+              <button id="btn_flip_opposite" onclick="safe(flipOpposite)">Flip opposite</button>
+              <button id="btn_continue_same" onclick="safe(continueSame)">Continue same</button>
               <button id="btn_status" onclick="safe(pollStatus)">Refresh status</button>
               <button id="btn_unlock" onclick="safe(unlockDay)">Unlock day</button>
               <button id="btn_latency" onclick="safe(loadLatency)">Latency</button>
@@ -291,6 +814,8 @@
           </div>
 
           <div class="kv" style="margin-top: 10px;">
+            <div class="k">Instrument</div><div class="v" id="v_underlying">-</div>
+            <div class="k">Contract</div><div class="v" id="v_contract_kind">-</div>
             <div class="k">Mode</div><div class="v" id="v_mode">-</div>
             <div class="k">Active ladder</div><div class="v" id="v_ladder">-</div>
             <div class="k">Position</div><div class="v" id="v_position">-</div>
@@ -307,7 +832,7 @@
             <div class="k">Lots open</div><div class="v" id="v_lots">-</div>
             <div class="k">Qty</div><div class="v mono" id="v_qty">-</div>
             <div class="k">Adds</div><div class="v" id="v_adds">-</div>
-            <div class="k">Weekly expiry</div><div class="v" id="v_weekly_expiry">-</div>
+            <div class="k">Expiry</div><div class="v" id="v_weekly_expiry">-</div>
             <div class="k">Loss count</div><div class="v" id="v_losses">-</div>
             <div class="k">Day locked</div><div class="v" id="v_locked">-</div>
             <div class="k">Last error</div><div class="v" id="v_err">-</div>
@@ -369,20 +894,69 @@
 
     <script>
       const $ = (id) => document.getElementById(id);
+      let lastStatus = null;
+      let busyFlag = false;
+      let lastMonthlyExpiryOffset = 0;
+      const monthlyOffsetByInstrument = { NIFTY: 0, BANKNIFTY: 0 };
 
       function engineKind() {
         const v = $("engine_kind") ? $("engine_kind").value : "BUY";
-        return v === "SELL" ? "SELL" : "BUY";
+        if (v === "SELL" || v === "HYBRID") return v;
+        return "BUY";
+      }
+
+      function instrumentMode() {
+        const v = $("instrument_mode") ? $("instrument_mode").value : "NIFTY";
+        if (v === "BANKNIFTY" || v === "BOTH") return v;
+        return "NIFTY";
+      }
+
+      function activeInstrument() {
+        if (instrumentMode() === "BOTH") {
+          const v = $("active_instrument") ? $("active_instrument").value : "NIFTY";
+          return v === "BANKNIFTY" ? "BANKNIFTY" : "NIFTY";
+        }
+        return instrumentMode() === "BANKNIFTY" ? "BANKNIFTY" : "NIFTY";
+      }
+
+      function apiPrefix() {
+        return activeInstrument() === "BANKNIFTY" ? "/api/bank" : "/api";
       }
 
       function apiBase() {
-        return engineKind() === "SELL" ? "/api/sell" : "/api";
+        const p = apiPrefix();
+        const k = engineKind();
+        if (k === "SELL") return `${p}/sell`;
+        if (k === "HYBRID") return `${p}/hybrid`;
+        return p;
+      }
+
+      function configPath() {
+        return activeInstrument() === "BANKNIFTY" ? "/api/bank/config" : "/api/config";
+      }
+
+      function configPathForInstrument(inst) {
+        return inst === "BANKNIFTY" ? "/api/bank/config" : "/api/config";
+      }
+
+      function formPrefixForInstrument(inst) {
+        return inst === "BANKNIFTY" ? "bank_" : "nifty_";
+      }
+
+      function cfgFlag(key) {
+        if (instrumentMode() === "BOTH") {
+          const p = formPrefixForInstrument(activeInstrument());
+          const el = $(p + key);
+          return !!(el && el.checked);
+        }
+        const el = $(key);
+        return !!(el && el.checked);
       }
 
       function toast(message, detail, kind = "info") {
         const wrap = $("toasts");
         const el = document.createElement("div");
-        el.className = `toast ${kind === "good" ? "good" : kind === "bad" ? "bad" : ""}`;
+        el.className = `toast ${kind === "good" ? "good" : kind === "bad" ? "bad" : kind === "warn" ? "warn" : ""}`;
         el.innerHTML = `<div>${escapeHtml(String(message))}</div>${detail ? `<div class="t">${escapeHtml(String(detail))}</div>` : ""}`;
         wrap.appendChild(el);
         setTimeout(() => el.style.opacity = "0.0", 4200);
@@ -394,10 +968,128 @@
       }
 
       function setBusy(busy) {
-        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_start","btn_stop","btn_sqoff","btn_status","btn_unlock","btn_latency"].forEach(id => {
+        busyFlag = !!busy;
+        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_start","btn_stop","btn_sqoff","btn_status","btn_unlock","btn_latency","btn_reload_nifty","btn_save_nifty","btn_reload_bank","btn_save_bank"].forEach(id => {
           const el = $(id);
           if (el) el.disabled = !!busy;
         });
+        updateManualDecisionButtons();
+      }
+
+      function lockInstrumentUi(prefix, inst) {
+        const strikeEl = $(prefix + "strike_step");
+        const contractEl = $(prefix + "contract_kind");
+        const weeklyEl = $(prefix + "weekly_expiry");
+
+        if (inst === "BANKNIFTY") {
+          if (strikeEl) { strikeEl.value = 100; strikeEl.disabled = true; }
+          if (contractEl) { contractEl.value = "MONTHLY"; contractEl.disabled = true; }
+          if (weeklyEl) { weeklyEl.value = "CURRENT"; weeklyEl.disabled = true; weeklyEl.style.opacity = "0.6"; }
+        } else {
+          if (strikeEl) strikeEl.disabled = false;
+          if (contractEl) contractEl.disabled = false;
+          const kind = contractEl ? contractEl.value : "WEEKLY";
+          if (weeklyEl) {
+            weeklyEl.disabled = (kind === "MONTHLY");
+            weeklyEl.style.opacity = weeklyEl.disabled ? "0.6" : "1.0";
+          }
+        }
+      }
+
+      function applyEngineKindUiRules() {
+        const isHybrid = engineKind() === "HYBRID";
+        const mode = instrumentMode();
+
+        const singleWrap = $("hybrid_cfg_wrap");
+        const niftyWrap = $("nifty_hybrid_cfg_wrap");
+        const bankWrap = $("bank_hybrid_cfg_wrap");
+
+        if (singleWrap) singleWrap.style.display = (isHybrid && mode !== "BOTH") ? "" : "none";
+        if (niftyWrap) niftyWrap.style.display = (isHybrid && mode === "BOTH") ? "" : "none";
+        if (bankWrap) bankWrap.style.display = (isHybrid && mode === "BOTH") ? "" : "none";
+
+        // Hybrid ignores these toggles; keep them visually consistent.
+        const disableToggles = (prefix) => {
+          const fa = $(prefix + "full_automation"); if (fa) { fa.disabled = isHybrid; fa.style.opacity = isHybrid ? "0.6" : "1.0"; }
+          const tdc = $(prefix + "trade_direction_continue"); if (tdc) { tdc.disabled = isHybrid; tdc.style.opacity = isHybrid ? "0.6" : "1.0"; }
+        };
+        if (mode === "BOTH") {
+          disableToggles("nifty_");
+          disableToggles("bank_");
+        } else {
+          disableToggles("");
+        }
+
+        // Hybrid has per-leg ladder params; hide the base ladder param fields to avoid duplicates.
+        const toggleFieldBlock = (domId, visible) => {
+          const el = $(domId);
+          if (!el) return;
+          const block = el.closest("div") || el.parentElement;
+          if (!block) return;
+          block.style.display = visible ? "" : "none";
+        };
+        const applyBaseParamVisibility = (prefix) => {
+          const showBase = !isHybrid;
+          toggleFieldBlock(prefix + "lots_per_add", showBase);
+          toggleFieldBlock(prefix + "initial_tsl_points", showBase);
+          toggleFieldBlock(prefix + "sequence_tsl_diff_points", showBase);
+          toggleFieldBlock(prefix + "target_points", showBase);
+          toggleFieldBlock(prefix + "max_adds", showBase);
+
+          // These are incompatible with hybrid behavior (auto BUY⇄SELL flip), so hide them too.
+          toggleFieldBlock(prefix + "full_automation", showBase);
+          toggleFieldBlock(prefix + "trade_direction_continue", showBase);
+        };
+        if (mode === "BOTH") {
+          applyBaseParamVisibility("nifty_");
+          applyBaseParamVisibility("bank_");
+        } else {
+          applyBaseParamVisibility("");
+        }
+      }
+
+      function applyInstrumentUiRules() {
+        const mode = instrumentMode();
+        const active = activeInstrument();
+
+        const activeWrap = $("active_instrument_wrap");
+        if (activeWrap) activeWrap.style.display = (mode === "BOTH") ? "" : "none";
+        if (mode !== "BOTH" && $("active_instrument")) $("active_instrument").value = active;
+
+        const single = $("strategy_single_card");
+        const nifty = $("strategy_nifty_card");
+        const bank = $("strategy_bank_card");
+        const tradeWrap = $("trading_enabled_wrap");
+        const credCard = $("credentials_card");
+
+        if (mode === "BOTH") {
+          if (single) single.style.display = "none";
+          if (nifty) nifty.style.display = "";
+          if (bank) bank.style.display = "";
+          if (tradeWrap) tradeWrap.style.display = "none";
+          if (credCard) credCard.style.gridColumn = "span 12";
+          lockInstrumentUi("nifty_", "NIFTY");
+          lockInstrumentUi("bank_", "BANKNIFTY");
+        } else {
+          if (single) single.style.display = "";
+          if (nifty) nifty.style.display = "none";
+          if (bank) bank.style.display = "none";
+          if (tradeWrap) tradeWrap.style.display = "";
+          if (credCard) credCard.style.gridColumn = "";
+          lockInstrumentUi("", active === "BANKNIFTY" ? "BANKNIFTY" : "NIFTY");
+        }
+        applyEngineKindUiRules();
+      }
+
+      function updateManualDecisionButtons() {
+        const flipBtn = $("btn_flip_opposite");
+        const contBtn = $("btn_continue_same");
+        const waiting = !!(lastStatus && lastStatus.mode === "waiting_manual");
+        const auto = cfgFlag("full_automation");
+        const contMode = cfgFlag("trade_direction_continue");
+        const allow = waiting && !auto && !contMode;
+        if (flipBtn) flipBtn.disabled = busyFlag || !allow;
+        if (contBtn) contBtn.disabled = busyFlag || !allow;
       }
 
       async function apiJson(path, opts = {}) {
@@ -461,6 +1153,59 @@
         }
       }
 
+      function setHybridInputs(prefix, cfg) {
+        const base = cfg || {};
+        const h = (cfg && cfg.hybrid) ? cfg.hybrid : {};
+
+        const exec = $(prefix + "hybrid_execution_mode");
+        if (exec) exec.value = h.execution_mode ?? "BUY";
+
+        function setLeg(legKey, legObj) {
+          const leg = legObj || {};
+          const id = (field) => `${prefix}hybrid_${legKey}_${field}`;
+          const lpa = $(id("lots_per_add")); if (lpa) lpa.value = (leg.lots_per_add ?? base.lots_per_add ?? 1);
+          const it = $(id("initial_tsl_points")); if (it) it.value = (leg.initial_tsl_points ?? base.initial_tsl_points ?? 10);
+          const sd = $(id("sequence_tsl_diff_points")); if (sd) sd.value = (leg.sequence_tsl_diff_points ?? base.sequence_tsl_diff_points ?? 1);
+          const tp = $(id("target_points")); if (tp) tp.value = (leg.target_points ?? base.target_points ?? 50);
+          const ma = $(id("max_adds")); if (ma) ma.value = (leg.max_adds ?? base.max_adds ?? 0);
+        }
+
+        setLeg("call_buy", h.call_buy);
+        setLeg("call_sell", h.call_sell);
+        setLeg("put_buy", h.put_buy);
+        setLeg("put_sell", h.put_sell);
+      }
+
+      function getHybridInputs(prefix) {
+        const exec = $(prefix + "hybrid_execution_mode");
+        const execution_mode = exec ? exec.value : "BUY";
+
+        function getLeg(legKey) {
+          const id = (field) => `${prefix}hybrid_${legKey}_${field}`;
+          const num = (domId, d) => {
+            const el = $(domId);
+            if (!el) return d;
+            const v = Number(el.value);
+            return Number.isFinite(v) ? v : d;
+          };
+          return {
+            lots_per_add: num(id("lots_per_add"), 1),
+            initial_tsl_points: num(id("initial_tsl_points"), 10),
+            sequence_tsl_diff_points: num(id("sequence_tsl_diff_points"), 1),
+            target_points: num(id("target_points"), 50),
+            max_adds: num(id("max_adds"), 0),
+          };
+        }
+
+        return {
+          execution_mode,
+          call_buy: getLeg("call_buy"),
+          call_sell: getLeg("call_sell"),
+          put_buy: getLeg("put_buy"),
+          put_sell: getLeg("put_sell"),
+        };
+      }
+
       function setForm(cfg) {
         $("client_id").value = cfg.client_id ?? "";
         $("access_token").value = cfg.access_token ?? "";
@@ -468,61 +1213,235 @@
         $("start_preference").value = cfg.start_preference ?? "AUTO";
         $("instant_start").checked = !!cfg.instant_start;
         $("strike_step").value = cfg.strike_step ?? 100;
+        $("contract_kind").value = cfg.contract_kind ?? "WEEKLY";
         $("weekly_expiry").value = cfg.weekly_expiry ?? "CURRENT";
-        $("add_step_points").value = cfg.add_step_points ?? 10;
+        lastMonthlyExpiryOffset = Number(cfg.monthly_expiry_offset ?? 0) || 0;
+        $("initial_tsl_points").value = cfg.initial_tsl_points ?? 10;
+        $("sequence_tsl_diff_points").value = cfg.sequence_tsl_diff_points ?? 1;
         $("target_points").value = cfg.target_points ?? 50;
-        $("trail_step_points").value = cfg.trail_step_points ?? 10;
-        $("stepwise_trailing").checked = !!cfg.stepwise_trailing;
-        $("initial_sl_points").value = cfg.initial_sl_points ?? 10;
+        $("pcl_trailing").checked = !!cfg.pcl_trailing;
+        $("pdh_trailing").checked = !!cfg.pdh_trailing;
+        $("candle_add_min_points").value = (cfg.candle_add_min_points ?? 5.0);
+        $("candle_stop_buffer_points").value = (cfg.candle_stop_buffer_points ?? 2.5);
+        $("full_automation").checked = !!cfg.full_automation;
         $("trade_direction_continue").checked = !!cfg.trade_direction_continue;
+        $("last_trade").checked = !!cfg.last_trade;
         $("lots_per_add").value = cfg.lots_per_add ?? 1;
         $("max_losses_per_day").value = cfg.max_losses_per_day ?? 5;
         $("max_adds").value = cfg.max_adds ?? 0;
         $("order_type").value = cfg.order_type ?? "MARKET";
         $("limit_price_offset").value = cfg.limit_price_offset ?? 0.0;
+        $("broker_qty_lookup").checked = !!cfg.broker_qty_lookup;
+        setHybridInputs("", cfg);
 
         $("pill_trade").textContent = cfg.trading_enabled ? "Trading enabled" : "Trading disabled";
         $("dot_trade").className = `dot ${cfg.trading_enabled ? "good" : ""}`;
+        applyInstrumentUiRules();
       }
 
       function getForm() {
-        return {
+        const inst = activeInstrument();
+        const base = {
           client_id: $("client_id").value || null,
           access_token: $("access_token").value || null,
           trading_enabled: !!$("trading_enabled").checked,
           start_preference: $("start_preference").value,
           instant_start: !!$("instant_start").checked,
           strike_step: Number($("strike_step").value),
+          contract_kind: $("contract_kind").value,
           weekly_expiry: $("weekly_expiry").value,
-          add_step_points: Number($("add_step_points").value),
+          monthly_expiry_offset: lastMonthlyExpiryOffset,
+          initial_tsl_points: Number($("initial_tsl_points").value),
+          sequence_tsl_diff_points: Number($("sequence_tsl_diff_points").value),
           target_points: Number($("target_points").value),
-          trail_step_points: Number($("trail_step_points").value),
-          stepwise_trailing: !!$("stepwise_trailing").checked,
-          initial_sl_points: Number($("initial_sl_points").value),
+          pcl_trailing: !!$("pcl_trailing").checked,
+          pdh_trailing: !!$("pdh_trailing").checked,
+          candle_add_min_points: Number($("candle_add_min_points").value),
+          candle_stop_buffer_points: Number($("candle_stop_buffer_points").value),
+          full_automation: !!$("full_automation").checked,
           trade_direction_continue: !!$("trade_direction_continue").checked,
+          last_trade: !!$("last_trade").checked,
           lots_per_add: Number($("lots_per_add").value),
           max_losses_per_day: Number($("max_losses_per_day").value),
           max_adds: Number($("max_adds").value),
           order_type: $("order_type").value,
-          limit_price_offset: Number($("limit_price_offset").value)
+          limit_price_offset: Number($("limit_price_offset").value),
+          broker_qty_lookup: !!$("broker_qty_lookup").checked,
+          hybrid: getHybridInputs(""),
         };
+
+        if (inst === "BANKNIFTY") {
+          base.strike_step = 100;
+          base.contract_kind = "MONTHLY";
+          base.weekly_expiry = "CURRENT";
+          base.monthly_expiry_offset = 0;
+        }
+        return base;
+      }
+
+      function setInstrumentForm(inst, cfg) {
+        const p = formPrefixForInstrument(inst);
+        const cid = (cfg && cfg.client_id !== undefined) ? cfg.client_id : null;
+        const tok = (cfg && cfg.access_token !== undefined) ? cfg.access_token : null;
+        if (!$("client_id").value && cid) $("client_id").value = String(cid);
+        if (!$("access_token").value && tok) $("access_token").value = String(tok);
+
+        const te = $(p + "trading_enabled"); if (te) te.checked = !!cfg.trading_enabled;
+        const sp = $(p + "start_preference"); if (sp) sp.value = cfg.start_preference ?? "AUTO";
+        const ins = $(p + "instant_start"); if (ins) ins.checked = !!cfg.instant_start;
+        const strike = $(p + "strike_step"); if (strike) strike.value = cfg.strike_step ?? 100;
+        const ck = $(p + "contract_kind"); if (ck) ck.value = cfg.contract_kind ?? "WEEKLY";
+        const wk = $(p + "weekly_expiry"); if (wk) wk.value = cfg.weekly_expiry ?? "CURRENT";
+
+        monthlyOffsetByInstrument[inst] = Number(cfg.monthly_expiry_offset ?? 0) || 0;
+
+        const it = $(p + "initial_tsl_points"); if (it) it.value = cfg.initial_tsl_points ?? 10;
+        const sd = $(p + "sequence_tsl_diff_points"); if (sd) sd.value = cfg.sequence_tsl_diff_points ?? 1;
+        const tp = $(p + "target_points"); if (tp) tp.value = cfg.target_points ?? 50;
+        const pcl = $(p + "pcl_trailing"); if (pcl) pcl.checked = !!cfg.pcl_trailing;
+        const pdh = $(p + "pdh_trailing"); if (pdh) pdh.checked = !!cfg.pdh_trailing;
+        const cap = $(p + "candle_add_min_points"); if (cap) cap.value = (cfg.candle_add_min_points ?? 5.0);
+        const sb = $(p + "candle_stop_buffer_points"); if (sb) sb.value = (cfg.candle_stop_buffer_points ?? 2.5);
+        const fa = $(p + "full_automation"); if (fa) fa.checked = !!cfg.full_automation;
+        const tdc = $(p + "trade_direction_continue"); if (tdc) tdc.checked = !!cfg.trade_direction_continue;
+        const lt = $(p + "last_trade"); if (lt) lt.checked = !!cfg.last_trade;
+
+        const lpa = $(p + "lots_per_add"); if (lpa) lpa.value = cfg.lots_per_add ?? 1;
+        const ml = $(p + "max_losses_per_day"); if (ml) ml.value = cfg.max_losses_per_day ?? 5;
+        const ma = $(p + "max_adds"); if (ma) ma.value = cfg.max_adds ?? 0;
+
+        const ot = $(p + "order_type"); if (ot) ot.value = cfg.order_type ?? "MARKET";
+        const lpo = $(p + "limit_price_offset"); if (lpo) lpo.value = cfg.limit_price_offset ?? 0.0;
+        const bq = $(p + "broker_qty_lookup"); if (bq) bq.checked = !!cfg.broker_qty_lookup;
+        setHybridInputs(p, cfg);
+
+        lockInstrumentUi(p, inst);
+      }
+
+      function getInstrumentForm(inst) {
+        const p = formPrefixForInstrument(inst);
+        const base = {
+          client_id: $("client_id").value || null,
+          access_token: $("access_token").value || null,
+          trading_enabled: !!($(p + "trading_enabled") && $(p + "trading_enabled").checked),
+          start_preference: ($(p + "start_preference") ? $(p + "start_preference").value : "AUTO"),
+          instant_start: !!($(p + "instant_start") && $(p + "instant_start").checked),
+          strike_step: Number($(p + "strike_step") ? $(p + "strike_step").value : 100),
+          contract_kind: ($(p + "contract_kind") ? $(p + "contract_kind").value : "WEEKLY"),
+          weekly_expiry: ($(p + "weekly_expiry") ? $(p + "weekly_expiry").value : "CURRENT"),
+          monthly_expiry_offset: Number(monthlyOffsetByInstrument[inst] ?? 0) || 0,
+          initial_tsl_points: Number($(p + "initial_tsl_points") ? $(p + "initial_tsl_points").value : 10),
+          sequence_tsl_diff_points: Number($(p + "sequence_tsl_diff_points") ? $(p + "sequence_tsl_diff_points").value : 1),
+          target_points: Number($(p + "target_points") ? $(p + "target_points").value : 50),
+          pcl_trailing: !!($(p + "pcl_trailing") && $(p + "pcl_trailing").checked),
+          pdh_trailing: !!($(p + "pdh_trailing") && $(p + "pdh_trailing").checked),
+          candle_add_min_points: Number($(p + "candle_add_min_points") ? $(p + "candle_add_min_points").value : 5.0),
+          candle_stop_buffer_points: Number($(p + "candle_stop_buffer_points") ? $(p + "candle_stop_buffer_points").value : 2.5),
+          full_automation: !!($(p + "full_automation") && $(p + "full_automation").checked),
+          trade_direction_continue: !!($(p + "trade_direction_continue") && $(p + "trade_direction_continue").checked),
+          last_trade: !!($(p + "last_trade") && $(p + "last_trade").checked),
+          lots_per_add: Number($(p + "lots_per_add") ? $(p + "lots_per_add").value : 1),
+          max_losses_per_day: Number($(p + "max_losses_per_day") ? $(p + "max_losses_per_day").value : 5),
+          max_adds: Number($(p + "max_adds") ? $(p + "max_adds").value : 0),
+          order_type: ($(p + "order_type") ? $(p + "order_type").value : "MARKET"),
+          limit_price_offset: Number($(p + "limit_price_offset") ? $(p + "limit_price_offset").value : 0.0),
+          broker_qty_lookup: !!($(p + "broker_qty_lookup") && $(p + "broker_qty_lookup").checked),
+          hybrid: getHybridInputs(p),
+        };
+
+        if (inst === "BANKNIFTY") {
+          base.strike_step = 100;
+          base.contract_kind = "MONTHLY";
+          base.weekly_expiry = "CURRENT";
+          base.monthly_expiry_offset = 0;
+        }
+        return base;
+      }
+
+      async function syncCredentialsToOtherInstrument(savedCfg) {
+        if (instrumentMode() !== "BOTH") return;
+        const other = activeInstrument() === "BANKNIFTY" ? "NIFTY" : "BANKNIFTY";
+        const path = other === "BANKNIFTY" ? "/api/bank/config" : "/api/config";
+        const patch = { client_id: savedCfg.client_id ?? null, access_token: savedCfg.access_token ?? null };
+        await apiJson(path, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+      }
+
+      async function loadNiftyConfig() {
+        const cfg = await apiJson("/api/config");
+        setInstrumentForm("NIFTY", cfg);
+        toast("NIFTY config loaded", null, "good");
+      }
+
+      async function loadBankConfig() {
+        const cfg = await apiJson("/api/bank/config");
+        setInstrumentForm("BANKNIFTY", cfg);
+        toast("BANKNIFTY config loaded", null, "good");
+      }
+
+      async function saveNiftyConfig() {
+        const cfg = getInstrumentForm("NIFTY");
+        const saved = await apiJson("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+        setInstrumentForm("NIFTY", saved);
+        await apiJson("/api/bank/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ client_id: saved.client_id ?? null, access_token: saved.access_token ?? null }) });
+        toast("NIFTY config saved", null, "good");
+      }
+
+      async function saveBankConfig() {
+        const cfg = getInstrumentForm("BANKNIFTY");
+        const saved = await apiJson("/api/bank/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+        setInstrumentForm("BANKNIFTY", saved);
+        await apiJson("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ client_id: saved.client_id ?? null, access_token: saved.access_token ?? null }) });
+        toast("BANKNIFTY config saved", null, "good");
       }
 
       async function loadConfig() {
-        const cfg = await apiJson("/api/config");
+        if (instrumentMode() === "BOTH") {
+          const [niftyCfg, bankCfg] = await Promise.all([apiJson("/api/config"), apiJson("/api/bank/config")]);
+          const nCid = niftyCfg.client_id ?? null;
+          const bCid = bankCfg.client_id ?? null;
+          const nTok = niftyCfg.access_token ?? null;
+          const bTok = bankCfg.access_token ?? null;
+          if (nCid && bCid && String(nCid) !== String(bCid)) toast("Warning", "client_id differs between configs", "warn");
+          if (nTok && bTok && String(nTok) !== String(bTok)) toast("Warning", "access_token differs between configs", "warn");
+          $("client_id").value = nCid ?? bCid ?? "";
+          $("access_token").value = nTok ?? bTok ?? "";
+          setInstrumentForm("NIFTY", niftyCfg);
+          setInstrumentForm("BANKNIFTY", bankCfg);
+          applyInstrumentUiRules();
+          toast("Configs loaded", null, "good");
+          return;
+        }
+        const cfg = await apiJson(configPath());
         setForm(cfg);
         toast("Config loaded", null, "good");
       }
 
       async function saveConfig() {
+        if (instrumentMode() === "BOTH") {
+          const [savedN, savedB] = await Promise.all([
+            apiJson("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(getInstrumentForm("NIFTY")) }),
+            apiJson("/api/bank/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(getInstrumentForm("BANKNIFTY")) }),
+          ]);
+          setInstrumentForm("NIFTY", savedN);
+          setInstrumentForm("BANKNIFTY", savedB);
+          applyInstrumentUiRules();
+          toast("Configs saved", null, "good");
+          return;
+        }
         const cfg = getForm();
-        const saved = await apiJson("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+        const saved = await apiJson(configPath(), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
         setForm(saved);
+        await syncCredentialsToOtherInstrument(saved);
         toast("Config saved", null, "good");
       }
 
       async function patchConfig(patch) {
-        const saved = await apiJson("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+        const saved = await apiJson(configPath(), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+        if (instrumentMode() === "BOTH") {
+          setInstrumentForm(activeInstrument(), saved);
+          applyInstrumentUiRules();
+          return;
+        }
         setForm(saved);
       }
 
@@ -549,6 +1468,18 @@
         const status = await apiJson(`${apiBase()}/engine/squareoff_stop`, { method: "POST" });
         renderStatus(status);
         toast("Squared off", "Position closed and day locked", "good");
+      }
+
+      async function flipOpposite() {
+        const status = await apiJson(`${apiBase()}/engine/flip_opposite`, { method: "POST" });
+        renderStatus(status);
+        toast("Flip opposite", null, "good");
+      }
+
+      async function continueSame() {
+        const status = await apiJson(`${apiBase()}/engine/continue_same`, { method: "POST" });
+        renderStatus(status);
+        toast("Continue same", null, "good");
       }
 
       async function pollStatus() {
@@ -609,7 +1540,10 @@
       }
 
       function renderStatus(status) {
+        lastStatus = status;
         $("status").textContent = JSON.stringify(status, null, 2);
+        $("v_underlying").textContent = status.underlying ?? "-";
+        $("v_contract_kind").textContent = status.contract_kind ?? "-";
         $("v_mode").textContent = status.mode ?? "-";
         $("v_ladder").textContent = status.active_ladder ?? "-";
         $("v_position").textContent = status.position ?? "-";
@@ -628,7 +1562,14 @@
         const addsDone = (status.adds_done ?? 0);
         const maxAdds = (status.max_adds ?? 0);
         $("v_adds").textContent = (maxAdds && maxAdds > 0) ? `${addsDone}/${maxAdds}` : String(addsDone);
-        $("v_weekly_expiry").textContent = status.weekly_expiry ?? "-";
+        const kind = String(status.contract_kind ?? "WEEKLY").toUpperCase();
+        if (kind === "MONTHLY") {
+          const off = Number(status.monthly_expiry_offset ?? 0) || 0;
+          $("v_weekly_expiry").textContent = off > 0 ? `MONTHLY +${off}` : "MONTHLY";
+        } else {
+          const wk = String(status.weekly_expiry ?? "-").toUpperCase();
+          $("v_weekly_expiry").textContent = (wk === "NEXT") ? "WEEKLY (NEXT)" : (wk === "CURRENT") ? "WEEKLY (CURRENT)" : wk;
+        }
         $("v_losses").textContent = String(status.loss_count ?? 0);
         $("v_locked").textContent = String(!!status.day_locked);
         $("v_err").textContent = status.last_error ? String(status.last_error) : "-";
@@ -640,6 +1581,8 @@
 
         const unlockBtn = $("btn_unlock");
         if (unlockBtn) unlockBtn.disabled = !status.day_locked;
+
+        updateManualDecisionButtons();
       }
 
       function renderLatency(lat) {
@@ -695,11 +1638,19 @@
       // Initial load
       const savedKind = localStorage.getItem("engine_kind");
       if (savedKind && $("engine_kind")) $("engine_kind").value = savedKind;
+      const savedMode = localStorage.getItem("instrument_mode");
+      if (savedMode && $("instrument_mode")) $("instrument_mode").value = savedMode;
+      const savedActiveInst = localStorage.getItem("active_instrument");
+      if (savedActiveInst && $("active_instrument")) $("active_instrument").value = savedActiveInst;
+      applyInstrumentUiRules();
       safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
 
       // Persist important toggles immediately so browser refresh keeps state.
       $("trading_enabled").addEventListener("change", () =>
         safe(async () => { await patchConfig({ trading_enabled: !!$("trading_enabled").checked }); toast("Saved", "trading_enabled", "good"); })
+      );
+      $("contract_kind").addEventListener("change", () =>
+        safe(async () => { applyInstrumentUiRules(); await patchConfig({ contract_kind: $("contract_kind").value }); toast("Saved", "contract_kind", "good"); })
       );
       $("start_preference").addEventListener("change", () =>
         safe(async () => { await patchConfig({ start_preference: $("start_preference").value }); toast("Saved", "start_preference", "good"); })
@@ -707,9 +1658,30 @@
       $("instant_start").addEventListener("change", () =>
         safe(async () => { await patchConfig({ instant_start: !!$("instant_start").checked }); toast("Saved", "instant_start", "good"); })
       );
+      $("full_automation").addEventListener("change", () =>
+        safe(async () => { await patchConfig({ full_automation: !!$("full_automation").checked }); toast("Saved", "full_automation", "good"); })
+      );
+      $("trade_direction_continue").addEventListener("change", () =>
+        safe(async () => { await patchConfig({ trade_direction_continue: !!$("trade_direction_continue").checked }); toast("Saved", "trade_direction_continue", "good"); })
+      );
+      $("broker_qty_lookup").addEventListener("change", () =>
+        safe(async () => { await patchConfig({ broker_qty_lookup: !!$("broker_qty_lookup").checked }); toast("Saved", "broker_qty_lookup", "good"); })
+      );
       $("engine_kind").addEventListener("change", () => {
         localStorage.setItem("engine_kind", engineKind());
+        applyEngineKindUiRules();
         safe(async () => { await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
+      });
+      $("instrument_mode").addEventListener("change", () => {
+        localStorage.setItem("instrument_mode", instrumentMode());
+        if (instrumentMode() !== "BOTH") localStorage.setItem("active_instrument", instrumentMode());
+        applyInstrumentUiRules();
+        safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
+      });
+      $("active_instrument").addEventListener("change", () => {
+        localStorage.setItem("active_instrument", activeInstrument());
+        applyInstrumentUiRules();
+        safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
       });
 
       // Light auto-poll when running (keeps UI updated without spamming)

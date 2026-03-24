@@ -6,7 +6,7 @@ FastAPI web app (not a desktop app) for running a 2-sided NIFTY options ladder s
 - Web dashboard to set `client_id`, `access_token`, strategy params, and enable/disable the engine
 - Dhan MarketFeed WebSocket subscription to **NIFTY spot** (security id `13`)
 - Background 1-minute candle aggregator (spot ticks → 1m OHLC)
-- Breakout entry logic (2 green / 2 red candles), then **flip-flop ladder** (CALL ↔ PUT) on trailing SL / target
+- Breakout entry logic (2 green / 2 red candles), then ladder management on trailing SL / target (manual decision after stop by default; toggle **Full automation** to auto-flip)
 - Instrument master downloader + weekly option selector from Dhan scrip-master CSV
 - Strike selection: BUY prefers ITM (strict ITM on exact strikes), SELL prefers one-step OTM (strict OTM on exact strikes)
 - Optional `instant_start` toggle to bypass breakout and start the first ladder immediately
