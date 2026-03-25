@@ -53,6 +53,33 @@ class SpotCandleService:
         st = self._nifty if u == "NIFTY" else self._bank if u == "BANKNIFTY" else None
         return None if st is None else st.last_1m
 
+    def status(self) -> dict:
+        n = self._nifty
+        b = self._bank
+
+        def _dump_candle(c: Optional[Candle]) -> Optional[dict]:
+            if c is None:
+                return None
+            return {
+                "start": c.start.isoformat(),
+                "end": c.end.isoformat(),
+                "open": float(c.open),
+                "high": float(c.high),
+                "low": float(c.low),
+                "close": float(c.close),
+                "green": bool(c.green),
+                "red": bool(c.red),
+            }
+
+        return {
+            "running": bool(self._running),
+            "last_error": self._last_error,
+            "nifty_spot_security_id": None if n is None else str(n.sid),
+            "bank_spot_security_id": None if b is None else str(b.sid),
+            "nifty_last_1m": _dump_candle(None if n is None else n.last_1m),
+            "bank_last_1m": _dump_candle(None if b is None else b.last_1m),
+        }
+
     def window_1m(self, underlying: str, limit: int = 200) -> list[Candle]:
         u = str(underlying).upper()
         st = self._nifty if u == "NIFTY" else self._bank if u == "BANKNIFTY" else None
@@ -94,9 +121,9 @@ class SpotCandleService:
             try:
                 await self._feed.connect()
             except Exception as e:
-                # Keep running with REST polling fallback.
+                # Keep running; websocket reconnect loop will recover.
                 self._feed.notify_ws_error(e)
-                self._last_error = f"spot candles: websocket connect failed (REST polling): {e}"
+                self._last_error = f"spot candles: websocket connect failed: {e}"
 
             self._running = True
             self._task = asyncio.create_task(self._loop(), name="spot_candle_service")

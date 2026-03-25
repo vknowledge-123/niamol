@@ -178,9 +178,9 @@ class EngineController:
                 try:
                     await self._feed.connect()
                 except Exception as e:
-                    # Don't hard-fail engine start on websocket issues; keep running with REST LTP polling.
+                    # Don't hard-fail engine start on websocket issues; allow reconnect loop to recover.
                     self._feed.notify_ws_error(e)
-                    msg = f"Dhan marketfeed websocket connection failed (using REST polling): {e}"
+                    msg = f"Dhan marketfeed websocket connection failed: {e}"
                     self._last_error = msg
                 self._rest = None
                 if mode == "LIVE":
@@ -532,6 +532,10 @@ class EngineController:
     def sim_status(self) -> dict:
         tick = self._engine.last_tick
         active_ladder = self._engine.active_side
+        active_contract = self._active_contract
+        active_ltp = None
+        if active_contract is not None:
+            active_ltp = self._option_ltps.get(active_contract.security_id)
         err = self._last_error
         if self._feed_error:
             err = f"{err} | {self._feed_error}" if err else self._feed_error
@@ -544,6 +548,9 @@ class EngineController:
             "active_ladder": None if active_ladder is None else self._display_side(active_ladder),
             "open_trade_id": None if self._sim_active is None else self._sim_active.id,
             "trades_total": len(self._sim_trades),
+            "active_contract_symbol": None if active_contract is None else active_contract.trading_symbol,
+            "active_contract_security_id": None if active_contract is None else active_contract.security_id,
+            "active_option_ltp": None if active_ltp is None else float(active_ltp),
             "last_error": err,
         }
 
@@ -731,13 +738,20 @@ class EngineController:
                         self._lat.inc("spot_ticks")
                     else:
                         t_opt0 = self._lat.now_ns() if sample else 0
-                        self._option_ltps[feed_tick.security_id] = feed_tick.ltp
+                        # Normalize to avoid leading-zero mismatches between scrip master and websocket ticks.
+                        secid = str(feed_tick.security_id or "").strip()
+                        if secid.isdigit():
+                            try:
+                                secid = str(int(secid))
+                            except Exception:
+                                pass
+                        self._option_ltps[secid] = feed_tick.ltp
                         if self._run_mode == "SIM":
-                            self._sim_on_option_tick(feed_tick.security_id, feed_tick.ltp)
+                            self._sim_on_option_tick(secid, feed_tick.ltp)
                         elif self._mtm_active is not None:
                             # Best-effort fill of pending entry premiums for live MTM tracking.
                             for tr in (self._mtm_active,):
-                                if tr.contract.security_id != feed_tick.security_id:
+                                if str(tr.contract.security_id) != secid:
                                     continue
                                 filled = 0
                                 for f in tr.fills:
@@ -749,7 +763,7 @@ class EngineController:
 
                         # Premium-driven ladder management: only act on ticks for the active contract.
                         active_contract = self._active_contract
-                        if active_contract is not None and str(feed_tick.security_id) == str(active_contract.security_id):
+                        if active_contract is not None and secid == str(active_contract.security_id):
                             last_spot = self._engine.last_tick
                             if last_spot is not None:
                                 t_s0 = self._lat.now_ns() if sample else 0

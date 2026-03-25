@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+import json
 import logging
 import random
 import time
 from typing import Optional
 
 import websockets
-from dhanhq import dhanhq as DhanHQ
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone
 
@@ -42,6 +42,16 @@ log = logging.getLogger("niftyalgo.dhan.feed")
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def _norm_secid(secid: object) -> str:
+    s = str(secid or "").strip()
+    if s.isdigit():
+        try:
+            return str(int(s))
+        except Exception:
+            return s
+    return s
+
+
 @dataclass(slots=True)
 class FeedTick:
     exchange_segment: int
@@ -52,7 +62,14 @@ class FeedTick:
 
 
 class DhanMarketFeed:
-    def __init__(self, client_id: str, access_token: str, spot_security_id: str | list[str]) -> None:
+    def __init__(
+        self,
+        client_id: str,
+        access_token: str,
+        spot_security_id: str | list[str],
+        *,
+        enable_rest_fallback: bool = False,
+    ) -> None:
         self._client_id = client_id
         self._access_token = access_token
         if isinstance(spot_security_id, list):
@@ -69,7 +86,9 @@ class DhanMarketFeed:
         self._feed = DhanFeed(
             client_id=self._client_id,
             access_token=self._access_token,
-            instruments=[(IDX, sid) for sid in self._spot_security_ids],
+            # Use 3-tuples everywhere (exchange, security_id, mode) so we can mix
+            # spot ticker + option quote subscriptions without mixing tuple sizes.
+            instruments=[(IDX, _norm_secid(sid), 15) for sid in self._spot_security_ids],
             # Dhan v1 feed often rejects handshake (HTTP 400) on newer infra.
             # v2 uses token+clientId in the URL query and is more reliable.
             version="v2",
@@ -85,12 +104,17 @@ class DhanMarketFeed:
         # If you want to tune these (e.g. behind flaky networks), make them configurable.
         self._ping_interval_s: float = 20.0
         self._ping_timeout_s: float = 20.0
+        self._enable_rest_fallback: bool = bool(enable_rest_fallback)
 
-        # REST fallback (LT P polling) when websocket is down.
-        self._rest = DhanHQ(client_id, access_token)
+        # REST fallback (disabled by default; websocket-only mode preferred).
+        self._rest = None
         self._rest_poll_interval_s: float = 1.0
         self._rest_next_poll_ts: float = 0.0
         self._rest_buffer: list[dict] = []
+        if self._enable_rest_fallback:
+            from dhanhq import dhanhq as DhanHQ
+
+            self._rest = DhanHQ(client_id, access_token)
 
     def _parse_ltt_to_ist(self, ltt: str) -> Optional[datetime]:
         """
@@ -182,16 +206,68 @@ class DhanMarketFeed:
         # DhanFeed marketfeed constants define NSE_FNO = 2 (byte).
         from dhanhq.marketfeed import NSE_FNO
 
-        sym = (NSE_FNO, str(security_id))
+        # Options: subscribe as QUOTE (17) for more reliable option LTP delivery on v2.
+        secid = _norm_secid(security_id)
+        sym = (NSE_FNO, secid, 17)
         async with self._lock:
-            self._feed.subscribe_symbols([sym])
+            # Keep local instrument list updated (needed for reconnect resubscribe).
+            unique_symbols_set = set(getattr(self._feed, "instruments", None) or [])
+            unique_symbols_set.add(sym)
+            self._feed.instruments = list(unique_symbols_set)
+
+            ws = getattr(self._feed, "ws", None)
+            if ws is None or getattr(ws, "closed", False):
+                return
+
+            # Dhan SDK's subscribe_symbols() uses ensure_future(), which can silently miss sends
+            # depending on loop context; send the v2 subscription message directly.
+            if str(getattr(self._feed, "version", "")).lower() == "v2":
+                msg = {
+                    "RequestCode": 17,  # Quote subscribe
+                    "InstrumentCount": 1,
+                    "InstrumentList": [
+                        {
+                            "ExchangeSegment": self._feed.get_exchange_segment(NSE_FNO),
+                            "SecurityId": secid,
+                        }
+                    ],
+                }
+                await ws.send(json.dumps(msg))
+            else:
+                self._feed.subscribe_symbols([sym])
 
     async def unsubscribe_option(self, security_id: str) -> None:
         from dhanhq.marketfeed import NSE_FNO
 
-        sym = (NSE_FNO, str(security_id))
+        secid = _norm_secid(security_id)
         async with self._lock:
-            self._feed.unsubscribe_symbols([sym])
+            unique_symbols_set = set(getattr(self._feed, "instruments", None) or [])
+            # Remove any matching option instrument regardless of mode (15/17/21).
+            to_remove = [t for t in unique_symbols_set if isinstance(t, tuple) and len(t) >= 2 and int(t[0]) == int(NSE_FNO) and _norm_secid(t[1]) == secid]  # type: ignore[index]
+            for t in to_remove:
+                with contextlib.suppress(KeyError):
+                    unique_symbols_set.remove(t)
+                self._feed.instruments = list(unique_symbols_set)
+
+            ws = getattr(self._feed, "ws", None)
+            if ws is None or getattr(ws, "closed", False):
+                return
+
+            if str(getattr(self._feed, "version", "")).lower() == "v2":
+                msg = {
+                    "RequestCode": 18,  # Quote unsubscribe
+                    "InstrumentCount": 1,
+                    "InstrumentList": [
+                        {
+                            "ExchangeSegment": self._feed.get_exchange_segment(NSE_FNO),
+                            "SecurityId": secid,
+                        }
+                    ],
+                }
+                await ws.send(json.dumps(msg))
+            else:
+                # Best-effort: unsubscribe quote mode (17) by default.
+                self._feed.unsubscribe_symbols([(NSE_FNO, secid, 17)])
 
     def _next_reconnect_delay_s(self) -> float:
         # Exponential backoff with jitter: 0.5, 1, 2, 4, ... up to 30s (+ small jitter)
@@ -282,6 +358,8 @@ class DhanMarketFeed:
         }.get(int(exchange_segment))
 
     async def _poll_rest_into_buffer(self) -> None:
+        if not self._enable_rest_fallback or self._rest is None:
+            return
         now = time.monotonic()
         if self._rest_buffer:
             return
@@ -439,6 +517,7 @@ class DhanMarketFeed:
             )
 
     async def recv_tick(self) -> Optional[FeedTick]:
+        data = None
         ws = getattr(self._feed, "ws", None)
         if ws is not None and not getattr(ws, "closed", False):
             try:
@@ -458,14 +537,17 @@ class DhanMarketFeed:
                 else:
                     raise
         else:
-            data = None
             self._ensure_reconnect()
 
         if data is None:
-            await self._poll_rest_into_buffer()
-            if not self._rest_buffer:
+            if self._enable_rest_fallback:
+                await self._poll_rest_into_buffer()
+                if self._rest_buffer:
+                    data = self._rest_buffer.pop(0)
+            if data is None:
+                # Prevent a tight loop when websocket is down and REST is disabled.
+                await asyncio.sleep(0.05)
                 return None
-            data = self._rest_buffer.pop(0)
 
         if not isinstance(data, dict):
             return None
@@ -481,7 +563,7 @@ class DhanMarketFeed:
             ts = self._parse_ltt_to_ist(str(ltt))
         return FeedTick(
             exchange_segment=int(data["exchange_segment"]),
-            security_id=str(data["security_id"]),
+            security_id=_norm_secid(data["security_id"]),
             ltp=ltp,
             ts=ts,
             ltt=None if ltt is None else str(ltt),

@@ -233,13 +233,21 @@ class InstrumentStore:
                     continue
 
                 secid = row.get("SEM_SMST_SECURITY_ID") or ""
+                # Normalize numeric security ids to avoid leading-zero mismatches
+                # with websocket ticks (which deliver security_id as an integer).
+                secid_n = str(secid).strip()
+                if secid_n.isdigit():
+                    try:
+                        secid_n = str(int(secid_n))
+                    except Exception:
+                        pass
                 lot_s = row.get("SEM_LOT_UNITS") or ""
                 try:
                     lot_size = int(float(lot_s))
                 except ValueError:
                     lot_size = 0
                 chosen = OptionContract(
-                    security_id=secid,
+                    security_id=secid_n,
                     trading_symbol=tsym,
                     expiry=exp,
                     strike=strike,
@@ -329,13 +337,19 @@ class InstrumentStore:
                     continue
 
                 secid = row.get("SEM_SMST_SECURITY_ID") or ""
+                secid_n = str(secid).strip()
+                if secid_n.isdigit():
+                    try:
+                        secid_n = str(int(secid_n))
+                    except Exception:
+                        pass
                 lot_s = row.get("SEM_LOT_UNITS") or ""
                 try:
                     lot_size = int(float(lot_s))
                 except ValueError:
                     lot_size = 0
                 chosen = OptionContract(
-                    security_id=secid,
+                    security_id=secid_n,
                     trading_symbol=tsym,
                     expiry=exp,
                     strike=strike,

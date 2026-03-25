@@ -802,6 +802,8 @@
             <div class="actions" style="margin-top:0;">
               <button id="btn_save2" class="btn-primary" onclick="safe(saveConfig)">Save config</button>
               <button id="btn_refresh" onclick="safe(refreshInstruments)">Refresh instruments</button>
+              <button id="btn_candles_start" onclick="safe(startCandles)">Prepare candles</button>
+              <button id="btn_candles_stop" onclick="safe(stopCandles)">Stop candles</button>
               <button id="btn_start" class="btn-primary" onclick="safe(startEngine)">Start engine</button>
               <button id="btn_stop" class="btn-danger" onclick="safe(stopEngine)">Stop engine</button>
               <button id="btn_sqoff" class="btn-danger" onclick="safe(squareOffStop)">Square off (stop)</button>
@@ -814,6 +816,10 @@
           </div>
 
           <div class="kv" style="margin-top: 10px;">
+            <div class="k">Candles</div><div class="v" id="v_candles_run">-</div>
+            <div class="k">NIFTY 1m</div><div class="v mono" id="v_candles_nifty">-</div>
+            <div class="k">BANK 1m</div><div class="v mono" id="v_candles_bank">-</div>
+            <div class="k">Candles err</div><div class="v" id="v_candles_err">-</div>
             <div class="k">Instrument</div><div class="v" id="v_underlying">-</div>
             <div class="k">Contract</div><div class="v" id="v_contract_kind">-</div>
             <div class="k">Mode</div><div class="v" id="v_mode">-</div>
@@ -860,6 +866,8 @@
             <div class="k">Mode</div><div class="v" id="sim_mode">-</div>
             <div class="k">Active ladder</div><div class="v" id="sim_ladder">-</div>
             <div class="k">Spot LTP</div><div class="v" id="sim_spot">-</div>
+            <div class="k">Contract</div><div class="v mono" id="sim_contract">-</div>
+            <div class="k">Option LTP</div><div class="v mono" id="sim_opt_ltp">-</div>
             <div class="k">Open trade</div><div class="v" id="sim_open">-</div>
             <div class="k">Trades total</div><div class="v" id="sim_count">0</div>
             <div class="k">Last error</div><div class="v" id="sim_err">-</div>
@@ -969,7 +977,7 @@
 
       function setBusy(busy) {
         busyFlag = !!busy;
-        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_start","btn_stop","btn_sqoff","btn_status","btn_unlock","btn_latency","btn_reload_nifty","btn_save_nifty","btn_reload_bank","btn_save_bank"].forEach(id => {
+        ["btn_reload","btn_save","btn_save2","btn_refresh","btn_candles_start","btn_candles_stop","btn_start","btn_stop","btn_sqoff","btn_status","btn_unlock","btn_latency","btn_reload_nifty","btn_save_nifty","btn_reload_bank","btn_save_bank"].forEach(id => {
           const el = $(id);
           if (el) el.disabled = !!busy;
         });
@@ -1487,6 +1495,40 @@
         renderStatus(status);
       }
 
+      function _fmt1mStatus(c) {
+        if (!c) return "-";
+        try {
+          const end = c.end ? fmtTs(c.end) : "-";
+          const o = (c.open === null || c.open === undefined) ? "-" : Number(c.open).toFixed(2);
+          const h = (c.high === null || c.high === undefined) ? "-" : Number(c.high).toFixed(2);
+          const l = (c.low === null || c.low === undefined) ? "-" : Number(c.low).toFixed(2);
+          const cl = (c.close === null || c.close === undefined) ? "-" : Number(c.close).toFixed(2);
+          return `${end} O:${o} H:${h} L:${l} C:${cl}`;
+        } catch {
+          return "-";
+        }
+      }
+
+      async function loadCandleStatus() {
+        const st = await apiJson(`/api/candles/status`);
+        $("v_candles_run").textContent = st.running ? "Running" : "Stopped";
+        $("v_candles_err").textContent = st.last_error ? String(st.last_error) : "-";
+        $("v_candles_nifty").textContent = _fmt1mStatus(st.nifty_last_1m);
+        $("v_candles_bank").textContent = _fmt1mStatus(st.bank_last_1m);
+      }
+
+      async function startCandles() {
+        await apiJson(`/api/candles/start`, { method: "POST" });
+        await loadCandleStatus();
+        toast("Candles", "Preparation started", "good");
+      }
+
+      async function stopCandles() {
+        await apiJson(`/api/candles/stop`, { method: "POST" });
+        await loadCandleStatus();
+        toast("Candles", "Preparation stopped", "info");
+      }
+
       async function unlockDay() {
         const status = await apiJson(`${apiBase()}/engine/unlock_day`, { method: "POST" });
         renderStatus(status);
@@ -1594,6 +1636,8 @@
         $("sim_mode").textContent = st.mode ?? "-";
         $("sim_ladder").textContent = st.active_ladder ?? "-";
         $("sim_spot").textContent = fmt(st.spot_ltp);
+        $("sim_contract").textContent = st.active_contract_symbol ?? "-";
+        $("sim_opt_ltp").textContent = fmt(st.active_option_ltp);
         $("sim_open").textContent = st.open_trade_id ? String(st.open_trade_id) : "-";
         $("sim_count").textContent = String(st.trades_total ?? 0);
         $("sim_err").textContent = st.last_error ? String(st.last_error) : "-";
@@ -1643,7 +1687,9 @@
       const savedActiveInst = localStorage.getItem("active_instrument");
       if (savedActiveInst && $("active_instrument")) $("active_instrument").value = savedActiveInst;
       applyInstrumentUiRules();
-      safe(async () => { await loadConfig(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
+      safe(async () => { await loadConfig(); await loadCandleStatus(); await pollStatus(); await pollSim(); await loadSimTrades(); await loadLatency(); });
+      // Keep candle status fresh so you can see when the last completed 1m candle is ready.
+      setInterval(() => safe(loadCandleStatus), 2000);
 
       // Persist important toggles immediately so browser refresh keeps state.
       $("trading_enabled").addEventListener("change", () =>
