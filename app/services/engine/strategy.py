@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Deque, Literal, Optional, TypeAlias
+from zoneinfo import ZoneInfo
 
 from app.runtime.settings import EngineConfig
 from app.services.market.models import Candle, SpotTick
@@ -12,6 +13,7 @@ from app.services.market.models import Candle, SpotTick
 
 LadderSide = Literal["CALL", "PUT"]
 DayLockReason = Literal["target", "max_losses", "manual_squareoff"]
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class Mode(str, Enum):
@@ -64,6 +66,11 @@ class LadderState:
     low_premium: Optional[float]
     adds_done: int
     lots_open: int
+    entry_ts: datetime = field(default_factory=lambda: datetime.now(tz=IST))
+    # Entry candle end (1m IST bucket end). Used to optionally block "same entry candle" adds.
+    entry_1m_end: Optional[datetime] = None
+    # Track the last 1m candle end on which we executed a candle-add (defensive: at most one add per candle).
+    last_add_1m_end: Optional[datetime] = None
     # Candle-based (spot) trailing stop anchor (1m candles in IST).
     candle_stop_spot: Optional[float] = None
     # Last seen option premium LTP (best-effort; used for candle stop loss-count logic).
@@ -259,8 +266,18 @@ class StrategyEngine:
         if not should_add:
             return []
 
+        # Enforce "one add per candle" even if the caller accidentally delivers duplicates.
+        if ladder.last_add_1m_end is not None and candle.end <= ladder.last_add_1m_end:
+            return []
+
+        # Optional rule: do not add on the entry candle close (entry happened within this 1m candle).
+        allow_same_entry = bool(getattr(cfg, "candle_add_allow_same_entry_candle", True))
+        if not allow_same_entry and ladder.entry_1m_end is not None and candle.end <= ladder.entry_1m_end:
+            return []
+
         ladder.adds_done += 1
         ladder.lots_open += int(cfg.lots_per_add)
+        ladder.last_add_1m_end = candle.end
         return [AddLot(side=ladder.side, spot=float(candle.close), levels=1)]
 
     def apply_execution_entry_premium(self, *, premium: float, cfg: EngineConfig) -> bool:
@@ -607,10 +624,23 @@ class StrategyEngine:
             return True
         return abs(float(prev) - float(ladder.stop_premium)) > 1e-12
 
+    @staticmethod
+    def _bucket_end(ts: datetime, tf_seconds: int) -> datetime:
+        if ts.tzinfo is None:
+            raise ValueError("tick timestamp must be timezone-aware")
+        epoch = int(ts.timestamp())
+        bucket_epoch = epoch - (epoch % int(tf_seconds))
+        end_epoch = bucket_epoch + int(tf_seconds)
+        return datetime.fromtimestamp(end_epoch, tz=ts.tzinfo)
+
     def _open_ladder(self, *, side: LadderSide, spot: float, cfg: EngineConfig) -> None:
+        entry_ts = self.last_tick.ts if self.last_tick is not None else datetime.now(tz=IST)
+        if entry_ts.tzinfo is None:
+            entry_ts = entry_ts.replace(tzinfo=IST)
         buf = self._candle_stop_buffer_points(cfg)
         self._ladder = LadderState(
             side=side,
+            entry_ts=entry_ts,
             entry_spot=spot,
             entry_premium=None,
             stop_premium=None,
@@ -618,6 +648,8 @@ class StrategyEngine:
             low_premium=None,
             adds_done=0,
             lots_open=cfg.lots_per_add,
+            entry_1m_end=self._bucket_end(entry_ts, 60),
+            last_add_1m_end=None,
             candle_stop_spot=(
                 None
                 if (not self._candle_trailing_enabled_for(side, cfg) or self._last_1m_candle is None)

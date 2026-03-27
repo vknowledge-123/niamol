@@ -99,6 +99,10 @@ class EngineConfig(BaseModel):
     pdh_trailing: bool = False
     candle_add_min_points: float = 5.0
     candle_stop_buffer_points: float = 2.5
+    # Candle-add behavior:
+    # - True  (default): allow a candle-close add even on the entry candle close.
+    # - False: strictly require at least one full 1m candle after entry before the first add.
+    candle_add_allow_same_entry_candle: bool = True
 
     max_losses_per_day: int = 5
 

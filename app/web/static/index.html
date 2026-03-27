@@ -252,6 +252,13 @@
               <input id="candle_stop_buffer_points" type="number" step="0.05" />
               <div class="small">Buffer is applied to spot stop: CALL stop = low - buffer, PUT stop = high + buffer.</div>
             </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="candle_add_allow_same_entry_candle" type="checkbox" style="width:auto;" />
+                Allow add on entry candle
+              </label>
+              <div class="small">If OFF: first candle-close add is allowed only from the next 1m candle after entry/flip.</div>
+            </div>
           </div>
 
           <div class="row2">
@@ -455,6 +462,12 @@
               <label>Candle stop buffer points</label>
               <input id="nifty_candle_stop_buffer_points" type="number" step="0.05" />
             </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_candle_add_allow_same_entry_candle" type="checkbox" style="width:auto;" />
+                Allow add on entry candle
+              </label>
+            </div>
           </div>
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
@@ -651,6 +664,12 @@
             <div style="flex:1; min-width: 220px;">
               <label>Candle stop buffer points</label>
               <input id="bank_candle_stop_buffer_points" type="number" step="0.05" />
+            </div>
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_candle_add_allow_same_entry_candle" type="checkbox" style="width:auto;" />
+                Allow add on entry candle
+              </label>
             </div>
           </div>
           <div class="row2">
@@ -1231,6 +1250,7 @@
         $("pdh_trailing").checked = !!cfg.pdh_trailing;
         $("candle_add_min_points").value = (cfg.candle_add_min_points ?? 5.0);
         $("candle_stop_buffer_points").value = (cfg.candle_stop_buffer_points ?? 2.5);
+        $("candle_add_allow_same_entry_candle").checked = (cfg.candle_add_allow_same_entry_candle === undefined) ? true : !!cfg.candle_add_allow_same_entry_candle;
         $("full_automation").checked = !!cfg.full_automation;
         $("trade_direction_continue").checked = !!cfg.trade_direction_continue;
         $("last_trade").checked = !!cfg.last_trade;
@@ -1266,6 +1286,7 @@
           pdh_trailing: !!$("pdh_trailing").checked,
           candle_add_min_points: Number($("candle_add_min_points").value),
           candle_stop_buffer_points: Number($("candle_stop_buffer_points").value),
+          candle_add_allow_same_entry_candle: !!$("candle_add_allow_same_entry_candle").checked,
           full_automation: !!$("full_automation").checked,
           trade_direction_continue: !!$("trade_direction_continue").checked,
           last_trade: !!$("last_trade").checked,
@@ -1310,6 +1331,7 @@
         const pdh = $(p + "pdh_trailing"); if (pdh) pdh.checked = !!cfg.pdh_trailing;
         const cap = $(p + "candle_add_min_points"); if (cap) cap.value = (cfg.candle_add_min_points ?? 5.0);
         const sb = $(p + "candle_stop_buffer_points"); if (sb) sb.value = (cfg.candle_stop_buffer_points ?? 2.5);
+        const same = $(p + "candle_add_allow_same_entry_candle"); if (same) same.checked = (cfg.candle_add_allow_same_entry_candle === undefined) ? true : !!cfg.candle_add_allow_same_entry_candle;
         const fa = $(p + "full_automation"); if (fa) fa.checked = !!cfg.full_automation;
         const tdc = $(p + "trade_direction_continue"); if (tdc) tdc.checked = !!cfg.trade_direction_continue;
         const lt = $(p + "last_trade"); if (lt) lt.checked = !!cfg.last_trade;
@@ -1345,6 +1367,7 @@
           pdh_trailing: !!($(p + "pdh_trailing") && $(p + "pdh_trailing").checked),
           candle_add_min_points: Number($(p + "candle_add_min_points") ? $(p + "candle_add_min_points").value : 5.0),
           candle_stop_buffer_points: Number($(p + "candle_stop_buffer_points") ? $(p + "candle_stop_buffer_points").value : 2.5),
+          candle_add_allow_same_entry_candle: ($(p + "candle_add_allow_same_entry_candle") ? !!$(p + "candle_add_allow_same_entry_candle").checked : true),
           full_automation: !!($(p + "full_automation") && $(p + "full_automation").checked),
           trade_direction_continue: !!($(p + "trade_direction_continue") && $(p + "trade_direction_continue").checked),
           last_trade: !!($(p + "last_trade") && $(p + "last_trade").checked),
