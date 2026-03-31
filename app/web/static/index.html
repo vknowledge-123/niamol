@@ -287,6 +287,16 @@
 
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="ghost_monitoring" type="checkbox" style="width:auto;" />
+                Ghost monitoring (BUY only)
+              </label>
+              <div class="small">LIVE only: after the first real ladder opens, the opposite side is monitored without placing orders; flips back to the start side place real orders.</div>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
               <label>Max losses/day</label>
               <input id="max_losses_per_day" type="number" />
             </div>
@@ -491,6 +501,14 @@
           </div>
           <div class="row2">
             <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="nifty_ghost_monitoring" type="checkbox" style="width:auto;" />
+                Ghost monitoring (BUY only)
+              </label>
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
               <label>Max losses/day</label>
               <input id="nifty_max_losses_per_day" type="number" />
             </div>
@@ -689,6 +707,14 @@
               <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
                 <input id="bank_last_trade" type="checkbox" style="width:auto;" />
                 Last trade (stop engine)
+              </label>
+            </div>
+          </div>
+          <div class="row2">
+            <div style="flex:1; min-width: 220px;">
+              <label style="display:flex;gap:10px;align-items:center;margin-top:0;">
+                <input id="bank_ghost_monitoring" type="checkbox" style="width:auto;" />
+                Ghost monitoring (BUY only)
               </label>
             </div>
           </div>
@@ -922,6 +948,9 @@
     <script>
       const $ = (id) => document.getElementById(id);
       let lastStatus = null;
+      const statusByInst = { NIFTY: null, BANKNIFTY: null };
+      const simStatusByInst = { NIFTY: null, BANKNIFTY: null };
+      const simTradesByInst = { NIFTY: [], BANKNIFTY: [] };
       let busyFlag = false;
       let lastMonthlyExpiryOffset = 0;
       const monthlyOffsetByInstrument = { NIFTY: 0, BANKNIFTY: 0 };
@@ -950,12 +979,20 @@
         return activeInstrument() === "BANKNIFTY" ? "/api/bank" : "/api";
       }
 
-      function apiBase() {
-        const p = apiPrefix();
+      function apiPrefixForInstrument(inst) {
+        return inst === "BANKNIFTY" ? "/api/bank" : "/api";
+      }
+
+      function apiBaseForInstrument(inst) {
+        const p = apiPrefixForInstrument(inst);
         const k = engineKind();
         if (k === "SELL") return `${p}/sell`;
         if (k === "HYBRID") return `${p}/hybrid`;
         return p;
+      }
+
+      function apiBase() {
+        return apiBaseForInstrument(activeInstrument());
       }
 
       function configPath() {
@@ -1025,6 +1062,7 @@
 
       function applyEngineKindUiRules() {
         const isHybrid = engineKind() === "HYBRID";
+        const isBuy = engineKind() === "BUY";
         const mode = instrumentMode();
 
         const singleWrap = $("hybrid_cfg_wrap");
@@ -1039,6 +1077,7 @@
         const disableToggles = (prefix) => {
           const fa = $(prefix + "full_automation"); if (fa) { fa.disabled = isHybrid; fa.style.opacity = isHybrid ? "0.6" : "1.0"; }
           const tdc = $(prefix + "trade_direction_continue"); if (tdc) { tdc.disabled = isHybrid; tdc.style.opacity = isHybrid ? "0.6" : "1.0"; }
+          const gm = $(prefix + "ghost_monitoring"); if (gm) { gm.disabled = !isBuy; gm.style.opacity = (!isBuy) ? "0.6" : "1.0"; }
         };
         if (mode === "BOTH") {
           disableToggles("nifty_");
@@ -1253,6 +1292,7 @@
         $("candle_add_allow_same_entry_candle").checked = (cfg.candle_add_allow_same_entry_candle === undefined) ? true : !!cfg.candle_add_allow_same_entry_candle;
         $("full_automation").checked = !!cfg.full_automation;
         $("trade_direction_continue").checked = !!cfg.trade_direction_continue;
+        $("ghost_monitoring").checked = !!cfg.ghost_monitoring;
         $("last_trade").checked = !!cfg.last_trade;
         $("lots_per_add").value = cfg.lots_per_add ?? 1;
         $("max_losses_per_day").value = cfg.max_losses_per_day ?? 5;
@@ -1289,6 +1329,7 @@
           candle_add_allow_same_entry_candle: !!$("candle_add_allow_same_entry_candle").checked,
           full_automation: !!$("full_automation").checked,
           trade_direction_continue: !!$("trade_direction_continue").checked,
+          ghost_monitoring: !!$("ghost_monitoring").checked,
           last_trade: !!$("last_trade").checked,
           lots_per_add: Number($("lots_per_add").value),
           max_losses_per_day: Number($("max_losses_per_day").value),
@@ -1334,6 +1375,7 @@
         const same = $(p + "candle_add_allow_same_entry_candle"); if (same) same.checked = (cfg.candle_add_allow_same_entry_candle === undefined) ? true : !!cfg.candle_add_allow_same_entry_candle;
         const fa = $(p + "full_automation"); if (fa) fa.checked = !!cfg.full_automation;
         const tdc = $(p + "trade_direction_continue"); if (tdc) tdc.checked = !!cfg.trade_direction_continue;
+        const gm = $(p + "ghost_monitoring"); if (gm) gm.checked = !!cfg.ghost_monitoring;
         const lt = $(p + "last_trade"); if (lt) lt.checked = !!cfg.last_trade;
 
         const lpa = $(p + "lots_per_add"); if (lpa) lpa.value = cfg.lots_per_add ?? 1;
@@ -1370,6 +1412,7 @@
           candle_add_allow_same_entry_candle: ($(p + "candle_add_allow_same_entry_candle") ? !!$(p + "candle_add_allow_same_entry_candle").checked : true),
           full_automation: !!($(p + "full_automation") && $(p + "full_automation").checked),
           trade_direction_continue: !!($(p + "trade_direction_continue") && $(p + "trade_direction_continue").checked),
+          ghost_monitoring: !!($(p + "ghost_monitoring") && $(p + "ghost_monitoring").checked),
           last_trade: !!($(p + "last_trade") && $(p + "last_trade").checked),
           lots_per_add: Number($(p + "lots_per_add") ? $(p + "lots_per_add").value : 1),
           max_losses_per_day: Number($(p + "max_losses_per_day") ? $(p + "max_losses_per_day").value : 5),
@@ -1484,12 +1527,34 @@
       }
 
       async function startEngine() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/engine/start`, { method: "POST" })));
+          const ok = Object.fromEntries(insts.map((inst, i) => [inst, res[i].status === "fulfilled" ? res[i].value : null]));
+          const bad = res.filter((r) => r.status === "rejected");
+          if (bad.length) toast("Engine start failed", String(bad[0].reason || bad[0]), "bad");
+          const status = ok[activeInstrument()] || ok.NIFTY || ok.BANKNIFTY;
+          if (status) renderStatus(status);
+          toast("Engines started", "NIFTY + BANKNIFTY", "good");
+          return;
+        }
         const status = await apiJson(`${apiBase()}/engine/start`, { method: "POST" });
         renderStatus(status);
         toast("Engine started", null, "good");
       }
 
       async function stopEngine() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/engine/stop`, { method: "POST" })));
+          const ok = Object.fromEntries(insts.map((inst, i) => [inst, res[i].status === "fulfilled" ? res[i].value : null]));
+          const bad = res.filter((r) => r.status === "rejected");
+          if (bad.length) toast("Engine stop failed", String(bad[0].reason || bad[0]), "bad");
+          const status = ok[activeInstrument()] || ok.NIFTY || ok.BANKNIFTY;
+          if (status) renderStatus(status);
+          toast("Engines stopped", "NIFTY + BANKNIFTY", "good");
+          return;
+        }
         const status = await apiJson(`${apiBase()}/engine/stop`, { method: "POST" });
         renderStatus(status);
         toast("Engine stopped", null, "good");
@@ -1514,6 +1579,14 @@
       }
 
       async function pollStatus() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/engine/status`)));
+          insts.forEach((inst, i) => { if (res[i].status === "fulfilled") statusByInst[inst] = res[i].value; });
+          const status = statusByInst[activeInstrument()] || statusByInst.NIFTY || statusByInst.BANKNIFTY;
+          if (status) renderStatus(status);
+          return;
+        }
         const status = await apiJson(`${apiBase()}/engine/status`);
         renderStatus(status);
       }
@@ -1565,6 +1638,18 @@
       }
 
       async function startSim() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/sim/start`, { method: "POST" })));
+          const ok = Object.fromEntries(insts.map((inst, i) => [inst, res[i].status === "fulfilled" ? res[i].value : null]));
+          const bad = res.filter((r) => r.status === "rejected");
+          if (bad.length) toast("Simulation start failed", String(bad[0].reason || bad[0]), "bad");
+          const st = ok[activeInstrument()] || ok.NIFTY || ok.BANKNIFTY;
+          if (st) renderSimStatus(st);
+          await loadSimTrades();
+          toast("Simulations started", "NIFTY + BANKNIFTY", "good");
+          return;
+        }
         const st = await apiJson(`${apiBase()}/sim/start`, { method: "POST" });
         renderSimStatus(st);
         await loadSimTrades();
@@ -1572,17 +1657,44 @@
       }
 
       async function stopSim() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/sim/stop`, { method: "POST" })));
+          const ok = Object.fromEntries(insts.map((inst, i) => [inst, res[i].status === "fulfilled" ? res[i].value : null]));
+          const bad = res.filter((r) => r.status === "rejected");
+          if (bad.length) toast("Simulation stop failed", String(bad[0].reason || bad[0]), "bad");
+          const st = ok[activeInstrument()] || ok.NIFTY || ok.BANKNIFTY;
+          if (st) renderSimStatus(st);
+          toast("Simulations stopped", "NIFTY + BANKNIFTY", "good");
+          return;
+        }
         const st = await apiJson(`${apiBase()}/sim/stop`, { method: "POST" });
         renderSimStatus(st);
         toast("Simulation stopped", null, "good");
       }
 
       async function pollSim() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/sim/status`)));
+          insts.forEach((inst, i) => { if (res[i].status === "fulfilled") simStatusByInst[inst] = res[i].value; });
+          const st = simStatusByInst[activeInstrument()] || simStatusByInst.NIFTY || simStatusByInst.BANKNIFTY;
+          if (st) renderSimStatus(st);
+          return;
+        }
         const st = await apiJson(`${apiBase()}/sim/status`);
         renderSimStatus(st);
       }
 
       async function loadSimTrades() {
+        if (instrumentMode() === "BOTH") {
+          const insts = ["NIFTY", "BANKNIFTY"];
+          const res = await Promise.allSettled(insts.map((inst) => apiJson(`${apiBaseForInstrument(inst)}/sim/trades?limit=200`)));
+          insts.forEach((inst, i) => { if (res[i].status === "fulfilled") simTradesByInst[inst] = res[i].value; });
+          const trades = simTradesByInst[activeInstrument()] || simTradesByInst.NIFTY || simTradesByInst.BANKNIFTY || [];
+          renderSimTrades(trades);
+          return;
+        }
         const trades = await apiJson(`${apiBase()}/sim/trades?limit=200`);
         renderSimTrades(trades);
       }
@@ -1732,6 +1844,9 @@
       );
       $("trade_direction_continue").addEventListener("change", () =>
         safe(async () => { await patchConfig({ trade_direction_continue: !!$("trade_direction_continue").checked }); toast("Saved", "trade_direction_continue", "good"); })
+      );
+      $("ghost_monitoring").addEventListener("change", () =>
+        safe(async () => { await patchConfig({ ghost_monitoring: !!$("ghost_monitoring").checked }); toast("Saved", "ghost_monitoring", "good"); })
       );
       $("broker_qty_lookup").addEventListener("change", () =>
         safe(async () => { await patchConfig({ broker_qty_lookup: !!$("broker_qty_lookup").checked }); toast("Saved", "broker_qty_lookup", "good"); })

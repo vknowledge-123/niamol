@@ -50,6 +50,7 @@ async def patch_config(request: Request, patch: dict[str, Any]) -> EngineConfig:
 async def start_engine(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx
     try:
+        await ctx.refresh_spot_candles()
         await ctx.engine.start()
         return await ctx.engine.status()
     except RuntimeError as e:

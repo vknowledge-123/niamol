@@ -25,6 +25,51 @@ log = logging.getLogger("niftyalgo.engine")
 IST = ZoneInfo("Asia/Kolkata")
 
 
+class _QueueMarketFeed:
+    """
+    Adapter to reuse the SpotCandleService marketfeed websocket in SIM mode.
+
+    This avoids opening multiple Dhan websockets (which can trigger HTTP 429).
+    """
+
+    def __init__(self, q: asyncio.Queue, spot_candles: object) -> None:
+        self._q = q
+        self._spot_candles = spot_candles
+
+    @property
+    def last_error(self) -> Optional[str]:
+        st = getattr(self._spot_candles, "status", None)
+        try:
+            d = st() if callable(st) else None
+            return None if not isinstance(d, dict) else d.get("last_error")
+        except Exception:
+            return None
+
+    async def connect(self) -> None:
+        return
+
+    async def disconnect(self) -> None:
+        unsub = getattr(self._spot_candles, "unsubscribe_ticks", None)
+        if callable(unsub):
+            try:
+                unsub(self._q)
+            except Exception:
+                pass
+
+    async def recv_tick(self):
+        return await self._q.get()
+
+    async def subscribe_option(self, security_id: str) -> None:
+        fn = getattr(self._spot_candles, "subscribe_option", None)
+        if callable(fn):
+            await fn(str(security_id))
+
+    async def unsubscribe_option(self, security_id: str) -> None:
+        fn = getattr(self._spot_candles, "unsubscribe_option", None)
+        if callable(fn):
+            await fn(str(security_id))
+
+
 @dataclass(slots=True)
 class _OrderBatch:
     # A batch is executed sequentially by the order worker.
@@ -36,6 +81,16 @@ class _OrderBatch:
 RunMode = Literal["LIVE", "SIM"]
 EngineKind = Literal["BUY", "SELL"]
 Underlying = Literal["NIFTY", "BANKNIFTY"]
+
+
+def _norm_secid(secid: object) -> str:
+    s = str(secid or "").strip()
+    if s.isdigit():
+        try:
+            return str(int(s))
+        except Exception:
+            return s
+    return s
 
 
 @dataclass(slots=True)
@@ -88,7 +143,7 @@ class EngineController:
         self._orders_task: Optional[asyncio.Task] = None
         self._orders_q: asyncio.Queue[_OrderBatch] = asyncio.Queue(maxsize=2048)
 
-        self._feed: Optional[DhanMarketFeed] = None
+        self._feed: Optional[object] = None
         self._rest: Optional[DhanRest] = None
 
         self._active_contract: Optional[OptionContract] = None
@@ -110,6 +165,10 @@ class EngineController:
         self._mtm_active: Optional[_SimTrade] = None
         # Broker execution updates may arrive out-of-band; keep a small pending buffer keyed by security_id.
         self._pending_exec_entry_premiums: dict[str, float] = {}
+
+        # Ghost monitoring (BUY engine, LIVE only): opposite side can be monitored without orders.
+        self._ghost_side: Optional[str] = None  # CALL/PUT that should be ghost
+        self._ghost_active: bool = False
 
         # Cached config override to allow simulation even when config.trading_enabled is false.
         self._sim_cfg_ver: int = -1
@@ -146,6 +205,23 @@ class EngineController:
             return f"{trade_side}_SELL"
         return trade_side
 
+    def _ghost_monitoring_enabled(self, cfg) -> bool:
+        return bool(
+            self._run_mode == "LIVE"
+            and self._kind == "BUY"
+            and type(self) is EngineController
+            and bool(getattr(cfg, "ghost_monitoring", False))
+        )
+
+    def _ensure_ghost_side(self, opened_side: str, cfg) -> None:
+        if not self._ghost_monitoring_enabled(cfg):
+            return
+        if self._ghost_side is not None:
+            return
+        s = str(opened_side).upper()
+        if s in ("CALL", "PUT"):
+            self._ghost_side = "PUT" if s == "CALL" else "CALL"
+
     async def start(self, mode: RunMode = "LIVE") -> None:
         async with self._lock:
             if self._running:
@@ -169,19 +245,41 @@ class EngineController:
                     raise RuntimeError(msg)
 
                 spot_sid = await self._instruments.spot_security_id(symbol=self._underlying, default=cfg.spot_security_id)
-                self._spot_security_id = str(spot_sid)
+                self._spot_security_id = _norm_secid(spot_sid)
 
                 # Clear previous non-fatal errors for this new run; keep any warnings we set during startup.
                 self._last_error = None
 
-                self._feed = DhanMarketFeed(cfg.client_id, cfg.access_token, spot_security_id=self._spot_security_id)
-                try:
-                    await self._feed.connect()
-                except Exception as e:
-                    # Don't hard-fail engine start on websocket issues; allow reconnect loop to recover.
-                    self._feed.notify_ws_error(e)
-                    msg = f"Dhan marketfeed websocket connection failed: {e}"
-                    self._last_error = msg
+                # Prefer reusing the background candle service websocket in SIM mode to avoid
+                # multiple concurrent Dhan websocket connections (can trigger HTTP 429).
+                used_shared = False
+                if self._spot_candles is not None:
+                    sub = getattr(self._spot_candles, "subscribe_ticks", None)
+                    st = getattr(self._spot_candles, "status", None)
+                    if callable(sub) and callable(st):
+                        try:
+                            s = st()
+                            running = bool(s.get("running")) if isinstance(s, dict) else False
+                        except Exception:
+                            running = False
+                        if running:
+                            q = sub()
+                            self._feed = _QueueMarketFeed(q, self._spot_candles)
+                            used_shared = True
+
+                if not used_shared:
+                    self._feed = DhanMarketFeed(cfg.client_id, cfg.access_token, spot_security_id=self._spot_security_id)
+                    try:
+                        await self._feed.connect()
+                    except Exception as e:
+                        # Don't hard-fail engine start on websocket issues; allow reconnect loop to recover.
+                        if hasattr(self._feed, "notify_ws_error"):
+                            try:
+                                self._feed.notify_ws_error(e)  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                        msg = f"Dhan marketfeed websocket connection failed: {e}"
+                        self._last_error = msg
                 self._rest = None
                 if mode == "LIVE":
                     self._rest = DhanRest(cfg.client_id, cfg.access_token)
@@ -208,12 +306,16 @@ class EngineController:
                 self._active_contract = None
                 self._option_ltps.clear()
                 self._mtm_active = None
+                self._ghost_side = None
+                self._ghost_active = False
                 self._run_mode = mode
                 if mode == "SIM":
                     self._sim_seq = 0
                     self._sim_trades.clear()
                     self._sim_active = None
                     self._mtm_active = None
+                    self._ghost_side = None
+                    self._ghost_active = False
 
                 self._running = True
                 self._lat.inc("engine_start")
@@ -271,6 +373,8 @@ class EngineController:
         self._active_contract = None
         self._option_ltps.clear()
         self._mtm_active = None
+        self._ghost_active = False
+        self._ghost_side = None
         self._lat.inc("engine_stop")
 
     async def status(self) -> EngineStatus:
@@ -282,11 +386,11 @@ class EngineController:
         active_contract = self._active_contract
         active_ltp = None
         if active_contract is not None:
-            active_ltp = self._option_ltps.get(active_contract.security_id)
+            active_ltp = self._option_ltps.get(_norm_secid(active_contract.security_id))
 
         active_qty = None
         if active_contract is not None:
-            active_qty = int(max(1, active_contract.lot_size) * int(lots_open))
+            active_qty = None if self._ghost_active else int(max(1, active_contract.lot_size) * int(lots_open))
 
         err = self._last_error
         if self._feed_error:
@@ -322,6 +426,9 @@ class EngineController:
             entry_premium=self._engine.entry_premium,
             stop_premium=self._engine.stop_premium,
             next_add_premium=self._engine.next_add_premium,
+            ghost_monitoring=bool(getattr(cfg, "ghost_monitoring", False)),
+            ghost_active=bool(self._ghost_active),
+            ghost_side=self._ghost_side,
             last_error=err,
         )
 
@@ -356,7 +463,7 @@ class EngineController:
             last_spot = self._engine.last_tick
             if active_contract is None or last_spot is None:
                 return
-            ltp = self._option_ltps.get(active_contract.security_id)
+            ltp = self._option_ltps.get(_norm_secid(active_contract.security_id))
             if ltp is None:
                 return
             now = datetime.now(tz=IST)
@@ -486,7 +593,7 @@ class EngineController:
             if qty_total > 0 and tr.fills and all(f.premium is not None for f in tr.fills):
                 entry_premium = sum(f.qty * float(f.premium) for f in tr.fills) / qty_total  # type: ignore[arg-type]
 
-            mark_premium = self._option_ltps.get(tr.contract.security_id)
+            mark_premium = self._option_ltps.get(_norm_secid(tr.contract.security_id))
             is_open = tr.exit_ts is None
             eff_exit_premium = (mark_premium if is_open else tr.exit_premium)
             eff_exit_spot = (last_spot if is_open else tr.exit_spot)
@@ -535,7 +642,7 @@ class EngineController:
         active_contract = self._active_contract
         active_ltp = None
         if active_contract is not None:
-            active_ltp = self._option_ltps.get(active_contract.security_id)
+            active_ltp = self._option_ltps.get(_norm_secid(active_contract.security_id))
         err = self._last_error
         if self._feed_error:
             err = f"{err} | {self._feed_error}" if err else self._feed_error
@@ -580,7 +687,7 @@ class EngineController:
         if not self._running:
             raise RuntimeError("Engine not running.")
 
-        secid = str(security_id)
+        secid = _norm_secid(security_id)
         price = float(avg_price)
         if price <= 0:
             raise RuntimeError("avg_price must be > 0")
@@ -601,7 +708,11 @@ class EngineController:
 
         async with self._market_lock:
             # Update MTM fill premiums for the active contract (best-effort).
-            if self._run_mode != "SIM" and self._mtm_active is not None and self._mtm_active.contract.security_id == secid:
+            if (
+                self._run_mode != "SIM"
+                and self._mtm_active is not None
+                and _norm_secid(self._mtm_active.contract.security_id) == secid
+            ):
                 if _is_add_tag(tag):
                     for f in reversed(self._mtm_active.fills):
                         if f.premium is None:
@@ -614,14 +725,14 @@ class EngineController:
                             break
 
             # Strategy: apply executed entry premium for the active ladder only.
-            if self._active_contract is not None and self._active_contract.security_id == secid:
+            if self._active_contract is not None and _norm_secid(self._active_contract.security_id) == secid:
                 if not _is_close_tag(tag) and (_is_entry_tag(tag) or (not _is_add_tag(tag) and self._engine.adds_done == 0)):
                     self._engine.apply_execution_entry_premium(premium=price, cfg=cfg_eng)
                 return
 
             # Not currently active: buffer only probable entry executions (so open/flip can consume it).
             if _is_entry_tag(tag) and not _is_close_tag(tag):
-                self._pending_exec_entry_premiums[secid] = price
+                self._pending_exec_entry_premiums[_norm_secid(secid)] = price
 
     async def _market_loop(self) -> None:
         assert self._feed is not None
@@ -634,7 +745,7 @@ class EngineController:
         agg_1m = None if self._spot_candles is not None else CandleAggregator(timeframe_seconds=60)
         spot_sid = self._spot_security_id
         if spot_sid is None:
-            spot_sid = str(await self._instruments.spot_security_id(symbol=self._underlying, default=cfg.spot_security_id))
+            spot_sid = _norm_secid(await self._instruments.spot_security_id(symbol=self._underlying, default=cfg.spot_security_id))
             self._spot_security_id = spot_sid
 
         while self._running:
@@ -680,7 +791,7 @@ class EngineController:
                         agg = CandleAggregator(timeframe_seconds=agg_tf)
 
                     # Route ticks: spot vs active option
-                    if feed_tick.security_id == str(spot_sid):
+                    if _norm_secid(feed_tick.security_id) == str(spot_sid):
                         t_spot0 = self._lat.now_ns() if sample else 0
                         tick = SpotTick(ts=now, ltp=feed_tick.ltp)
                         t_agg0 = self._lat.now_ns() if sample else 0
@@ -763,7 +874,7 @@ class EngineController:
 
                         # Premium-driven ladder management: only act on ticks for the active contract.
                         active_contract = self._active_contract
-                        if active_contract is not None and secid == str(active_contract.security_id):
+                        if active_contract is not None and secid == _norm_secid(active_contract.security_id):
                             last_spot = self._engine.last_tick
                             if last_spot is not None:
                                 t_s0 = self._lat.now_ns() if sample else 0
@@ -829,9 +940,14 @@ class EngineController:
             if stop_after:
                 break
             if isinstance(action, OpenLadder):
-                await self._open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
+                self._ensure_ghost_side(action.side, cfg)
+                if self._ghost_monitoring_enabled(cfg) and self._ghost_side == str(action.side).upper():
+                    await self._ghost_open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
+                else:
+                    await self._open_ladder(side=action.side, spot=action.spot, cfg=cfg, now=now)
             elif isinstance(action, AddLot):
-                await self._add_lots(side=action.side, levels=action.levels, spot=action.spot, cfg=cfg, now=now)
+                if not self._ghost_active:
+                    await self._add_lots(side=action.side, levels=action.levels, spot=action.spot, cfg=cfg, now=now)
             elif isinstance(action, CloseLadder):
                 final = _is_last_trade_exit(str(action.reason))
                 await self._close_ladder(
@@ -857,7 +973,7 @@ class EngineController:
             return
         filled = 0
         for tr in reversed(self._sim_trades):
-            if tr.contract.security_id != security_id:
+            if _norm_secid(tr.contract.security_id) != security_id:
                 continue
             did = False
             for f in tr.fills:
@@ -902,8 +1018,15 @@ class EngineController:
         self._active_contract = contract
 
         qty = max(1, contract.lot_size) * cfg.lots_per_add
-        prem = self._option_ltps.get(contract.security_id)
+        prem = self._option_ltps.get(_norm_secid(contract.security_id))
         tr.fills.append(_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem)))
+
+    async def _ghost_open_ladder(self, *, side: str, spot: float, cfg, now: datetime, unsubscribe_old: Optional[OptionContract] = None) -> None:
+        contract = await self._select_option_contract(side=side, spot=spot, now=now, cfg=cfg)
+        await self._ensure_option_subscription(contract, unsubscribe_old=unsubscribe_old)
+        self._active_contract = contract
+        self._mtm_active = None
+        self._ghost_active = True
 
     async def _sim_open_ladder(self, *, side: str, spot: float, cfg, now: datetime) -> None:
         contract = await self._select_option_contract(side=side, spot=spot, now=now, cfg=cfg)
@@ -916,7 +1039,7 @@ class EngineController:
         if levels <= 0:
             return
         qty = max(1, tr.contract.lot_size) * cfg.lots_per_add * int(levels)
-        prem = self._option_ltps.get(tr.contract.security_id)
+        prem = self._option_ltps.get(_norm_secid(tr.contract.security_id))
         tr.fills.append(_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem)))
 
     async def _sim_close_ladder(
@@ -926,7 +1049,7 @@ class EngineController:
         if tr is None:
             return
 
-        prem = self._option_ltps.get(tr.contract.security_id)
+        prem = self._option_ltps.get(_norm_secid(tr.contract.security_id))
         tr.exit_ts = now
         tr.exit_spot = float(spot)
         tr.exit_premium = None if prem is None else float(prem)
@@ -943,18 +1066,19 @@ class EngineController:
                 side=flip_to, spot=spot, contract=new_contract, cfg=cfg, now=now, unsubscribe_old=old_contract
             )
 
-    async def _open_ladder(self, *, side: str, spot: float, cfg, now: datetime) -> None:
+    async def _open_ladder(self, *, side: str, spot: float, cfg, now: datetime, unsubscribe_old: Optional[OptionContract] = None) -> None:
         contract = await self._select_option_contract(side=side, spot=spot, now=now, cfg=cfg)
-        await self._ensure_option_subscription(contract)
+        await self._ensure_option_subscription(contract, unsubscribe_old=unsubscribe_old)
 
         qty = max(1, contract.lot_size) * cfg.lots_per_add
         txn = "BUY" if self._kind == "BUY" else "SELL"
         tag = f"open_{self._display_side(str(side)).lower()}"
-        await self._enqueue_orders([(txn, contract.security_id, qty, tag)], cfg=cfg)
+        await self._enqueue_orders([(txn, _norm_secid(contract.security_id), qty, tag)], cfg=cfg)
         self._active_contract = contract
+        self._ghost_active = False
 
         if self._run_mode != "SIM":
-            prem = self._option_ltps.get(contract.security_id)
+            prem = self._option_ltps.get(_norm_secid(contract.security_id))
             strategy_side = str(side)
             trade_side = self._map_strategy_to_trade_side(strategy_side)
             self._mtm_active = _SimTrade(
@@ -966,7 +1090,7 @@ class EngineController:
                 contract=contract,
                 fills=[_SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem))],
             )
-            pending = self._pending_exec_entry_premiums.pop(contract.security_id, None)
+            pending = self._pending_exec_entry_premiums.pop(_norm_secid(contract.security_id), None)
             if pending is not None:
                 if self._mtm_active.fills and self._mtm_active.fills[0].premium is None:
                     self._mtm_active.fills[0].premium = float(pending)
@@ -980,10 +1104,10 @@ class EngineController:
         qty = max(1, self._active_contract.lot_size) * cfg.lots_per_add * levels
         txn = "BUY" if self._kind == "BUY" else "SELL"
         tag = f"add_{self._display_side(str(side)).lower()}"
-        await self._enqueue_orders([(txn, self._active_contract.security_id, qty, tag)], cfg=cfg)
+        await self._enqueue_orders([(txn, _norm_secid(self._active_contract.security_id), qty, tag)], cfg=cfg)
 
         if self._run_mode != "SIM" and self._mtm_active is not None:
-            prem = self._option_ltps.get(self._active_contract.security_id)
+            prem = self._option_ltps.get(_norm_secid(self._active_contract.security_id))
             self._mtm_active.fills.append(
                 _SimFill(ts=now, spot=float(spot), qty=int(qty), premium=None if prem is None else float(prem))
             )
@@ -999,6 +1123,40 @@ class EngineController:
             str(reason or "") == "target" or str(reason or "").startswith("stop_")
         )
 
+        if flip_to and not self._engine.day_locked and self._ghost_monitoring_enabled(cfg):
+            # Ghost monitoring: when flipping to the ghost side, do not open a new broker position.
+            # When flipping from ghost back to real, open the broker position normally.
+            self._ensure_ghost_side(str(side).upper(), cfg)
+            flip_side = str(flip_to).upper()
+            new_is_ghost = self._ghost_side is not None and flip_side == self._ghost_side
+
+            if not self._ghost_active:
+                # Closing a real position.
+                if old_contract and old_qty > 0:
+                    ops = [
+                        (
+                            close_txn,
+                            _norm_secid(old_contract.security_id),
+                            old_qty,
+                            f"close_{self._display_side(str(side)).lower()}_{reason}",
+                        )
+                    ]
+                    if last_trade_final:
+                        await self._enqueue_orders_and_wait(ops, cfg=cfg)
+                    else:
+                        await self._enqueue_orders(ops, cfg=cfg)
+
+            # Clear old ladder tracking before opening the next side.
+            self._active_contract = None
+            self._mtm_active = None
+
+            # Open the next ladder side (ghost or real) for monitoring.
+            if new_is_ghost:
+                await self._ghost_open_ladder(side=flip_side, spot=spot, cfg=cfg, now=now, unsubscribe_old=old_contract)
+            else:
+                await self._open_ladder(side=flip_side, spot=spot, cfg=cfg, now=now, unsubscribe_old=old_contract)
+            return
+
         if flip_to and not self._engine.day_locked:
             # Flip: open opposite first, then close current ladder.
             new_contract = await self._select_option_contract(side=flip_to, spot=spot, now=now, cfg=cfg)
@@ -1006,14 +1164,26 @@ class EngineController:
             new_qty = max(1, new_contract.lot_size) * cfg.lots_per_add
 
             ops: list[tuple[str, str, int, str]] = [
-                (open_txn, new_contract.security_id, new_qty, f"flip_open_{self._display_side(str(flip_to)).lower()}")
+                (
+                    open_txn,
+                    _norm_secid(new_contract.security_id),
+                    new_qty,
+                    f"flip_open_{self._display_side(str(flip_to)).lower()}",
+                )
             ]
             if old_contract and old_qty > 0:
-                ops.append((close_txn, old_contract.security_id, old_qty, f"flip_close_{self._display_side(str(side)).lower()}"))
+                ops.append(
+                    (
+                        close_txn,
+                        _norm_secid(old_contract.security_id),
+                        old_qty,
+                        f"flip_close_{self._display_side(str(side)).lower()}",
+                    )
+                )
             await self._enqueue_orders(ops, cfg=cfg)
             self._active_contract = new_contract
             if self._run_mode != "SIM":
-                prem = self._option_ltps.get(new_contract.security_id)
+                prem = self._option_ltps.get(_norm_secid(new_contract.security_id))
                 strategy_side = str(flip_to)
                 trade_side = self._map_strategy_to_trade_side(strategy_side)
                 self._mtm_active = _SimTrade(
@@ -1032,21 +1202,37 @@ class EngineController:
                         )
                     ],
                 )
-                pending = self._pending_exec_entry_premiums.pop(new_contract.security_id, None)
+                pending = self._pending_exec_entry_premiums.pop(_norm_secid(new_contract.security_id), None)
                 if pending is not None:
                     if self._mtm_active.fills and self._mtm_active.fills[0].premium is None:
                         self._mtm_active.fills[0].premium = float(pending)
                     self._engine.apply_execution_entry_premium(premium=float(pending), cfg=cfg)
             return
 
+        if self._ghost_active:
+            # Ghost ladder has no broker position; just clear local tracking.
+            self._active_contract = None
+            self._ghost_active = False
+            if self._run_mode != "SIM":
+                self._mtm_active = None
+            return
+
         # Normal close (target / day lock / stop max losses)
         if old_contract and old_qty > 0:
-            ops = [(close_txn, old_contract.security_id, old_qty, f"close_{self._display_side(str(side)).lower()}_{reason}")]
+            ops = [
+                (
+                    close_txn,
+                    _norm_secid(old_contract.security_id),
+                    old_qty,
+                    f"close_{self._display_side(str(side)).lower()}_{reason}",
+                )
+            ]
             if last_trade_final:
                 await self._enqueue_orders_and_wait(ops, cfg=cfg)
             else:
                 await self._enqueue_orders(ops, cfg=cfg)
         self._active_contract = None
+        self._ghost_active = False
         if self._run_mode != "SIM":
             self._mtm_active = None
 
@@ -1131,9 +1317,21 @@ class EngineController:
     async def _ensure_option_subscription(self, contract: OptionContract, unsubscribe_old: Optional[OptionContract] = None) -> None:
         if self._feed is None:
             return
-        await self._feed.subscribe_option(contract.security_id)
+        await self._feed.subscribe_option(_norm_secid(contract.security_id))
         if unsubscribe_old is not None and unsubscribe_old.security_id != contract.security_id:
-            await self._feed.unsubscribe_option(unsubscribe_old.security_id)
+            await self._feed.unsubscribe_option(_norm_secid(unsubscribe_old.security_id))
+            # Avoid reusing a stale cached LTP after flipping back to an old contract.
+            old_secid = str(unsubscribe_old.security_id or "").strip()
+            if old_secid:
+                self._option_ltps.pop(old_secid, None)
+                self._pending_exec_entry_premiums.pop(old_secid, None)
+                if old_secid.isdigit():
+                    try:
+                        norm = str(int(old_secid))
+                        self._option_ltps.pop(norm, None)
+                        self._pending_exec_entry_premiums.pop(norm, None)
+                    except Exception:
+                        pass
 
     async def _enqueue_orders(self, ops: list[tuple[str, str, int, str]], *, cfg) -> None:
         t0 = self._lat.now_ns()
@@ -1187,7 +1385,7 @@ class EngineController:
         close_txn = "SELL" if self._kind == "BUY" else "BUY"
         if old_contract and old_qty > 0:
             tag = f"close_{self._display_side(str(side)).lower()}_{reason}"
-            await self._enqueue_orders_and_wait([(close_txn, old_contract.security_id, old_qty, tag)], cfg=cfg)
+            await self._enqueue_orders_and_wait([(close_txn, _norm_secid(old_contract.security_id), old_qty, tag)], cfg=cfg)
         self._active_contract = None
         if self._run_mode != "SIM":
             self._mtm_active = None
@@ -1203,7 +1401,7 @@ class EngineController:
             return local_qty
 
         try:
-            broker_qty = await asyncio.to_thread(self._rest.get_net_position_qty, security_id=contract.security_id)
+            broker_qty = await asyncio.to_thread(self._rest.get_net_position_qty, security_id=_norm_secid(contract.security_id))
         except Exception as e:
             log.warning("broker position lookup failed for secid=%s; using local qty=%s: %s", contract.security_id, local_qty, e)
             return local_qty

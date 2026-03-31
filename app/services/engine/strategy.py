@@ -244,7 +244,10 @@ class StrategyEngine:
 
         # --- Adds (spot candle close only) ---------------------------------------
         max_adds = int(getattr(cfg, "max_adds", 0) or 0)
-        if max_adds > 0 and int(ladder.adds_done) >= max_adds:
+        # Semantics: max_adds <= 0 means "no adds" (single entry only).
+        if max_adds <= 0:
+            return []
+        if int(ladder.adds_done) >= max_adds:
             return []
 
         min_pts = float(self._last_cfg_candle_add_min_points or 0.0)
@@ -549,20 +552,21 @@ class StrategyEngine:
 
         extreme = float(ladder.high_premium) if self._kind == "BUY" else float(ladder.low_premium)
         to_add = 0
-        while True:
-            if max_adds > 0 and int(ladder.adds_done) + int(to_add) >= max_adds:
-                break
-            next_n = int(ladder.adds_done) + int(to_add) + 1
-            thresh = _next_threshold(entry, next_n)
-            if thresh is None:
-                break
-            if self._kind == "BUY":
-                if extreme + 1e-12 < float(thresh):
+        if max_adds > 0:
+            while True:
+                if int(ladder.adds_done) + int(to_add) >= max_adds:
                     break
-            else:
-                if extreme - 1e-12 > float(thresh):
+                next_n = int(ladder.adds_done) + int(to_add) + 1
+                thresh = _next_threshold(entry, next_n)
+                if thresh is None:
                     break
-            to_add += 1
+                if self._kind == "BUY":
+                    if extreme + 1e-12 < float(thresh):
+                        break
+                else:
+                    if extreme - 1e-12 > float(thresh):
+                        break
+                to_add += 1
 
         if to_add > 0:
             ladder.adds_done += int(to_add)

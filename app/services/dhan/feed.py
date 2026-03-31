@@ -300,11 +300,23 @@ class DhanMarketFeed:
     def _note_ws_disconnect(self, exc: BaseException) -> None:
         self._reconnect_attempt = min(self._reconnect_attempt + 1, 16)
         delay_s = self._next_reconnect_delay_s()
+        # If the server rate-limits websocket connections (HTTP 429), back off more aggressively.
+        try:
+            status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        except Exception:
+            status_code = None
+        if status_code == 429 or "HTTP 429" in str(exc):
+            delay_s = max(delay_s, 10.0)
         desc = self._describe_disconnect(exc)
+        rest_note = (
+            f"Using REST LTP polling every {self._rest_poll_interval_s:.0f}s meanwhile."
+            if self._enable_rest_fallback and self._rest is not None
+            else "Waiting for websocket reconnect."
+        )
         self.last_error = (
             f"Marketfeed disconnected ({desc}). "
             f"Retrying websocket in {delay_s:.2f}s (attempt {self._reconnect_attempt}). "
-            f"Using REST LTP polling every {self._rest_poll_interval_s:.0f}s meanwhile."
+            f"{rest_note}"
         )
 
         now = time.monotonic()

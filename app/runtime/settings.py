@@ -116,6 +116,11 @@ class EngineConfig(BaseModel):
     # (Flip opposite / Continue same from the UI).
     trade_direction_continue: bool = False
 
+    # BUY engine only (LIVE): when enabled, after the first real ladder starts,
+    # the opposite ladder side is monitored "ghost" (no broker orders), while the
+    # starting side continues to place real orders on flips back.
+    ghost_monitoring: bool = False
+
     # If enabled, after the current ladder exits on target or TSL/stop,
     # the controller stops the engine (no further trades until manual start).
     last_trade: bool = False
@@ -124,7 +129,8 @@ class EngineConfig(BaseModel):
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     limit_price_offset: float = 0.0
     lots_per_add: int = 1
-    max_adds: int = 0  # 0 = unlimited
+    # Semantics: max_adds <= 0 disables adds (single entry only).
+    max_adds: int = 0
 
     # If enabled, confirm close quantity using broker position lookup (slower, but can be more accurate).
     # If disabled, square-off uses local qty derived from ladder state (ultra-low latency).
@@ -173,6 +179,11 @@ class EngineStatus(BaseModel):
     entry_premium: Optional[float] = None
     stop_premium: Optional[float] = None
     next_add_premium: Optional[float] = None
+
+    # Ghost monitoring (BUY engine only; LIVE mode).
+    ghost_monitoring: bool = False
+    ghost_active: bool = False
+    ghost_side: Optional[str] = None
     last_error: Optional[str] = None
 
 

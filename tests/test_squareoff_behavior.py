@@ -85,7 +85,7 @@ class SquareOffBehaviorTests(unittest.IsolatedAsyncioTestCase):
             initial_tsl_points=5.0,
             sequence_tsl_diff_points=1.0,
             lots_per_add=1,
-            max_adds=0,
+            max_adds=10,
             max_losses_per_day=5,
         )
         engine._ladder = LadderState(

@@ -14,6 +14,7 @@ router = APIRouter()
 async def start_sell_engine(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx
     try:
+        await ctx.refresh_spot_candles()
         await ctx.bank_sell_engine.start()
         return await ctx.bank_sell_engine.status()
     except RuntimeError as e:
@@ -99,4 +100,3 @@ async def sell_engine_order_execution(request: Request, upd: OrderExecutionUpdat
         return await ctx.bank_sell_engine.status()
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-

@@ -14,6 +14,7 @@ router = APIRouter()
 async def start_hybrid_engine(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx
     try:
+        await ctx.refresh_spot_candles()
         await ctx.hybrid_engine.start()
         return await ctx.hybrid_engine.status()
     except RuntimeError as e:

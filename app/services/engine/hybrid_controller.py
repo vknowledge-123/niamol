@@ -5,7 +5,7 @@ from typing import Optional
 
 from app.runtime.instruments import OptionContract
 from app.runtime.settings import EngineConfig, HybridLegConfig
-from app.services.engine.controller import EngineController
+from app.services.engine.controller import EngineController, _norm_secid
 from app.services.engine.strategy import AddLot, CloseLadder, OpenLadder, StrategyEngine
 
 
@@ -137,7 +137,7 @@ class HybridEngineController(EngineController):
             last_spot = self._engine.last_tick
             if active_contract is None or last_spot is None:
                 return
-            ltp = self._option_ltps.get(active_contract.security_id)
+            ltp = self._option_ltps.get(_norm_secid(active_contract.security_id))
             if ltp is None:
                 return
             now = datetime.now(tz=getattr(last_spot.ts, "tzinfo", None))
@@ -191,7 +191,7 @@ class HybridEngineController(EngineController):
 
         txn = "SELL" if old_kind == "BUY" else "BUY"
         tag = f"open_{self._hybrid_display_for(side=side, kind=new_kind).lower()}"
-        await self._enqueue_orders([(txn, contract.security_id, int(old_qty) + int(extra_qty), tag)], cfg=cfg_new)
+        await self._enqueue_orders([(txn, _norm_secid(contract.security_id), int(old_qty) + int(extra_qty), tag)], cfg=cfg_new)
 
         # Switch controller kind + strategy engine to the new leg.
         self._kind = "SELL" if new_kind == "SELL" else "BUY"
@@ -203,7 +203,7 @@ class HybridEngineController(EngineController):
 
         # Reset live MTM tracker to the new leg (best-effort).
         if self._run_mode != "SIM":
-            prem = self._option_ltps.get(contract.security_id)
+            prem = self._option_ltps.get(_norm_secid(contract.security_id))
             from app.services.engine.controller import _SimFill, _SimTrade  # local import to avoid circular typing
 
             self._mtm_active = _SimTrade(

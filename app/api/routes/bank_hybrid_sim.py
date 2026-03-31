@@ -9,6 +9,7 @@ router = APIRouter()
 async def start_bank_hybrid_sim(request: Request) -> dict:
     ctx = request.app.state.ctx
     try:
+        await ctx.refresh_spot_candles()
         await ctx.bank_hybrid_engine.start(mode="SIM")
         return ctx.bank_hybrid_engine.sim_status()
     except RuntimeError as e:
@@ -33,4 +34,3 @@ async def bank_hybrid_sim_status(request: Request) -> dict:
 @router.get("/hybrid/sim/trades")
 async def bank_hybrid_sim_trades(request: Request, limit: int = Query(default=200, ge=1, le=2000)) -> list[dict]:
     return request.app.state.ctx.bank_hybrid_engine.sim_trades(limit=limit)
-

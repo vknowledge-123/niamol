@@ -15,6 +15,7 @@ router = APIRouter()
 async def start_sell_engine(request: Request) -> EngineStatus:
     ctx = request.app.state.ctx
     try:
+        await ctx.refresh_spot_candles()
         await ctx.sell_engine.start()
         return await ctx.sell_engine.status()
     except RuntimeError as e:

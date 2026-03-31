@@ -19,6 +19,16 @@ log = logging.getLogger("niftyalgo.spot_candles")
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def _norm_secid(secid: object) -> str:
+    s = str(secid or "").strip()
+    if s.isdigit():
+        try:
+            return str(int(s))
+        except Exception:
+            return s
+    return s
+
+
 @dataclass(slots=True)
 class _State:
     sid: str
@@ -41,6 +51,7 @@ class SpotCandleService:
         self._task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._last_error: Optional[str] = None
+        self._subs: set[asyncio.Queue] = set()
 
         self._nifty: Optional[_State] = None
         self._bank: Optional[_State] = None
@@ -80,6 +91,31 @@ class SpotCandleService:
             "bank_last_1m": _dump_candle(None if b is None else b.last_1m),
         }
 
+    def subscribe_ticks(self, *, maxsize: int = 2048) -> asyncio.Queue:
+        """
+        Subscribe to the raw marketfeed ticks that this service receives.
+
+        Used to let SIM engines reuse a single websocket connection (avoids HTTP 429).
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(maxsize)))
+        self._subs.add(q)
+        return q
+
+    def unsubscribe_ticks(self, q: asyncio.Queue) -> None:
+        self._subs.discard(q)
+
+    async def subscribe_option(self, security_id: str) -> None:
+        async with self._lock:
+            if not self._running or self._feed is None:
+                return
+            await self._feed.subscribe_option(str(security_id))
+
+    async def unsubscribe_option(self, security_id: str) -> None:
+        async with self._lock:
+            if not self._running or self._feed is None:
+                return
+            await self._feed.unsubscribe_option(str(security_id))
+
     def window_1m(self, underlying: str, limit: int = 200) -> list[Candle]:
         u = str(underlying).upper()
         st = self._nifty if u == "NIFTY" else self._bank if u == "BANKNIFTY" else None
@@ -112,8 +148,8 @@ class SpotCandleService:
 
             self._client_id = str(client_id)
             self._access_token = str(access_token)
-            nifty_sid = str(nifty_spot_security_id)
-            bank_sid = str(bank_spot_security_id)
+            nifty_sid = _norm_secid(nifty_spot_security_id)
+            bank_sid = _norm_secid(bank_spot_security_id)
             self._nifty = _State(sid=nifty_sid, agg_1m=CandleAggregator(timeframe_seconds=60))
             self._bank = _State(sid=bank_sid, agg_1m=CandleAggregator(timeframe_seconds=60))
 
@@ -143,6 +179,7 @@ class SpotCandleService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._feed.disconnect()
             self._feed = None
+        self._subs.clear()
 
     async def _loop(self) -> None:
         assert self._feed is not None
@@ -153,6 +190,21 @@ class SpotCandleService:
                 tick = await self._feed.recv_tick()
                 if tick is None:
                     continue
+
+                # Broadcast raw ticks to subscribers (best-effort).
+                if self._subs:
+                    dead: list[asyncio.Queue] = []
+                    for q in list(self._subs):
+                        try:
+                            q.put_nowait(tick)
+                        except asyncio.QueueFull:
+                            # Drop if consumer is slow.
+                            pass
+                        except Exception:
+                            dead.append(q)
+                    for q in dead:
+                        self._subs.discard(q)
+
                 now = tick.ts if tick.ts is not None else datetime.now(tz=IST)
                 sid = str(tick.security_id)
                 ltp = float(tick.ltp)

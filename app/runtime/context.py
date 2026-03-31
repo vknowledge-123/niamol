@@ -67,9 +67,20 @@ class AppContext:
         access_token = cfg.access_token or bcfg.access_token
         if not client_id or not access_token:
             return
+
+        # Prefer spot security ids from the scrip master (when loaded) so the
+        # candle service and engines always agree on the spot_sid values.
+        nifty_sid = str(cfg.spot_security_id)
+        bank_sid = str(bcfg.spot_security_id)
+        try:
+            if self.instruments.loaded:
+                nifty_sid = str(await self.instruments.spot_security_id(symbol="NIFTY", default=nifty_sid))
+                bank_sid = str(await self.instruments.spot_security_id(symbol="BANKNIFTY", default=bank_sid))
+        except Exception:
+            pass
         await self.spot_candles.start(
             client_id=str(client_id),
             access_token=str(access_token),
-            nifty_spot_security_id=str(cfg.spot_security_id),
-            bank_spot_security_id=str(bcfg.spot_security_id),
+            nifty_spot_security_id=nifty_sid,
+            bank_spot_security_id=bank_sid,
         )
